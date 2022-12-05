@@ -1,0 +1,155 @@
+(*
+
+This model contains the full solution combining two interleaved linkable and unlinkable chains. A linkable chain update is always performed by two TEEs, while an unlinkable one is either performed always by the same one or by the two distinct ones.
+
+In this file, we model the two TEEs that are communicating directly with the attacker. As such, the attacker is playing the role of a dishonest server trying to track the TEEs.
+
+
+With 32 cores:
+ * 8 linkable + 8 unlikable = 54s, 68MB
+ * 12L + 24U =OOM>500G in 10m.
+ * 12L + 12U = Verified in 19h29m43s using 23GB of memory.
+
+*)
+
+free att.
+free sk.
+free skAtt.
+free none.
+fun sign/2.
+fun pk/1.
+fun true/0.
+fun false/0.
+fun blind/2.
+fun unblind/2.
+
+reduc checksign(sign(x,y),x,pk(y))=true;
+      checksign(unblind(sign(blind(x,y),z),y),x,pk(z))=true.
+
+
+let UnlinkableL(stateTEEs) =
+   in(stateTEEs, both);
+   let (sL,sR) = both in
+   let (SNL,ltokenL, (token,sigtok, cert)) = sL in
+   new ntoken;
+   new blinder;
+   new skL;
+   out(att, (token,sigtok,blind(ntoken,blinder), blind(pk(skL),blinder) ) );
+
+   in(att, inL);
+   let (bsig, certsig) = inL in
+   let nsig = unblind(bsig,blinder) in
+   if checksign(nsig,ntoken,pk(sk)) = true then
+      (* if the server forwared us a valid new token, we continue normaly. *)
+        let csig = unblind(certsig,blinder) in
+   	if checksign(csig,pk(skL),pk(skAtt)) = true then      
+	      out(stateTEEs, ( (SNL, ltokenL, (ntoken,nsig, (skL,csig))),
+	                      sR
+			     )
+		)	     
+.
+
+
+
+let UnlinkableR(stateTEEs) =
+   in(stateTEEs, both);
+   let (sL,sR) = both in
+   let (SNR,ltokenR, (token,sigtok, cert)) = sR in
+   new ntoken;
+   new blinder;
+   new skR;
+   out(att, (token,sigtok,blind(ntoken,blinder), blind(pk(skR),blinder) ) );
+
+   in(att, inR);
+   let (bsig, certsig) = inR in
+   let nsig = unblind(bsig,blinder) in
+   if checksign(nsig,ntoken,pk(sk)) = true then
+      (* if the server forwared us a valid new token, we continue normaly. *)
+        let csig = unblind(certsig,blinder) in
+   	if checksign(csig,pk(skR),pk(skAtt)) = true then      
+	      out(stateTEEs, ( sL,
+	      		     (SNR, ltokenR, (ntoken,nsig, (skR,csig)))
+			     )
+		)	     
+.
+
+
+
+
+
+let LinkableLR(stateTEEs) =
+   (* we perform both linkable updates one after another. *)
+   in(stateTEEs, both );
+   let (sL,sR) = both in
+   
+   (* Left update *)
+   let (SNL,tokenL, blindedsL) = sL in
+
+   new ntokenL;
+   new blinderL;
+   out(att, (SNL,tokenL,blind(ntokenL,blinderL)));
+
+   in(att, inL);
+   let (ltokenL, bsigL) = inL in
+   let nsigL = unblind(bsigL,blinderL) in
+   if checksign(nsigL,ntokenL,pk(sk)) = true then
+      (* if the server forwarded us a valid new token, we do the update of the right one *)
+      (
+       let (SNR,tokenR, blindedsR) = sR in
+
+       new ntokenR;
+       new blinderR;
+       out(att, (SNR,tokenR,blind(ntokenR,blinderR)));
+
+       in(att, inR);
+       let (ltokenR,bsigR) = inR in
+       let nsigR = unblind(bsigR,blinderR) in
+       if checksign(nsigR,ntokenR,pk(sk)) = true then
+       (* if the server forwarded us a valid new token, we finally update the double state *)
+       out(stateTEEs,  (
+                         (SNL, ltokenL ,  (ntokenL,nsigL, none)   )
+			 ,
+		  	(SNR, ltokenR ,  (ntokenR,nsigR, none)   )
+		       )
+
+          )
+      ).
+
+   
+
+let InitLR(stateTEEs) =
+   new SNL;
+   new linktokenL;   
+   new SNR;
+   new linktokenR;
+   out(stateTEEs, ((SNL,linktokenL,none), (SNR,linktokenR,none))).
+   
+   
+
+let Left =
+   new stateTEEs;
+ (
+   InitLR(stateTEEs)
+   |
+  !^12 LinkableLR(stateTEEs)
+  |
+  !^12  UnlinkableL(stateTEEs)   
+  
+ ).
+
+let Right =
+   new stateTEEs;
+ (
+   InitLR(stateTEEs)
+   |
+  !^12 LinkableLR(stateTEEs)   
+  |
+  !^6  UnlinkableL(stateTEEs)
+  |
+  !^6 UnlinkableR(stateTEEs)   
+
+).
+
+
+
+query session_equiv(Left,Right).

@@ -1,0 +1,90 @@
+(*
+
+DeepSec verification of the fact that given two distinct TEEs t1 and t2, a provider performing one time authorization with them cannot distinguish whether it is only interacting with t1, or with both t1 and t2 at the same time.
+
+We model this by having a global state maintained over channel pid, that contains a pair (x,y) such that x is the state of t1 and y is the state of t2. There is then a proces RenewL which performs an update for t1 over x, and RenewR over y for t2. We do not model the providers actions, as it is the attacker.
+
+
+
+Verification for a bounded number of updates (laptop):
+  * !^5 in .3s
+  * !^6 in 1.7s
+  * !^7 in 6.5s
+  * !^8 in 27s
+
+Verification on colossus:
+ * !^8 in 17s
+ * !^9 in 1m18s
+
+*)
+
+free att.
+free sk.
+fun sign/2.
+fun pk/1.
+fun true/0.
+fun false/0.
+fun blind/2.
+fun unblind/2.
+
+reduc checksign(sign(x,y),x,pk(y))=true;
+      checksign(unblind(sign(blind(x,y),z),y),x,pk(z))=true.
+
+
+let RenewL(pid) =
+   in(pid, both  );
+   let (x,y) = both in
+   let (token,sigtok) = x in
+   new ntoken;
+   new blinder;
+   out(att, (token,sigtok,blind(ntoken,blinder)));
+
+   in(att, bsig);
+   let nsig = unblind(bsig,blinder) in
+      out(pid, ((ntoken,nsig), y))
+.
+
+
+
+let RenewR(pid) =
+   in(pid, both );
+   let (x,y) = both in
+   let (token,sigtok) = y in
+   new ntoken;
+   new blinder;
+   out(att, (token,sigtok,blind(ntoken,blinder)));
+
+   in(att, bsig);
+   let nsig = unblind(bsig,blinder) in
+      out(pid, (x, (ntoken,nsig) ))
+
+.
+
+
+let InitLR(pid) =
+   new token;
+   new blinder;
+   new token2;
+   new blinder2;
+   out(pid,   ( (token,unblind(sign(blind(token,blinder),sk),blinder)),    (token2,unblind(sign(blind(token2,blinder2),sk),blinder2)) ) ).
+
+let Left =
+   new pid;
+ (
+   InitLR(pid)
+ | ( !^8 RenewR(pid))
+ | ( !^8 RenewR(pid)) 
+ ).
+
+let Right =
+   new pid;
+ (
+   InitLR(pid)
+ | ( !^8 RenewL(pid))
+ | ( !^8 RenewR(pid))
+
+).
+
+
+
+query trace_equiv(Left,Right).

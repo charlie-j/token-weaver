@@ -1,0 +1,2092 @@
+theory UnlinkAuth
+
+/*
+==============================================================================
+summary of summaries:
+
+analyzed: AC_provisioning_proved.spthy
+
+  tee_upid (all-traces): verified (2 steps)
+  tee_statestrong (all-traces): verified (20 steps)
+  loop_breaker (all-traces): verified (33 steps)
+  mastersec (all-traces): verified (44 steps)
+  mastersecbis (all-traces): verified (44 steps)
+  sanity (exists-trace): verified (8 steps)
+  tee_uniq (all-traces): verified (18 steps)
+  tee_progress (all-traces): verified (148 steps)
+  tee_state (all-traces): verified (9 steps)
+  tee_progressL (all-traces): verified (105 steps)
+  ltok_uniq (all-traces): verified (27 steps)
+  authAttPCSLfirst (all-traces): verified (64 steps)
+  PCS_LinkableAuth (all-traces): verified (4 steps)
+  ossid (all-traces): verified (8 steps)
+  ssid (all-traces): verified (2 steps)
+  inbetween (all-traces): verified (32 steps)
+  key_orig (all-traces): verified (40 steps)
+  consist (all-traces): verified (67 steps)
+  deprecateBislefttwo (all-traces): verified (2 steps)
+  authAttPCS (all-traces): verified (122 steps)
+
+==============================================================================
+
+real	0m13.623s
+user	1m4.739s
+sys	0m15.084s
+─( 15:23:16 )─< ~ >────────────────────────────────────────────────────────────────────────────[ 0 ]─
+$ time tamarin-prover AC_provisioning.spthy --prove +RTS -N8 -RTS
+
+
+*/
+
+begin
+
+functions: pk/1, sign/2, checksign/3, blind/2, unblind/2, true/0, uchain/1, lchain/1
+equations: // checksign( sign(m,k),m,pk(k) ) = true,
+	    checksign( unblind(sign(blind(m,r),k),r),m,pk(k) ) = true,
+
+
+rule serv_pid:
+ [Fr(~sid)]--[Once('x'),OSid(~sid)]->[L_S(~sid, 'null', 'null')]
+
+rule dummy:
+ []--[Deprecate('n','n')]->[]
+
+
+// Renew the attestation and provider key
+rule renew_ServerKey:
+     [Fr(~skP),Fr(~skA),L_S(~sid,x,y)]--[Deprecate(x,y),Keys(~skP,~skA),SSid(~sid)]->[!Skey(~skP,~skA), !PKey(pk(~skP),pk(~skA)), L_S(~sid,~skP,~skA)]
+     
+// everytime the key pair is loaded, CurrentKeys(pkS,pkA) must be raised
+// We then ensure that only the latest version of the keys is loaded
+
+restriction deprecateleft:
+ "All skP1 skA1  skA2 #i #j.
+       Deprecate(skP1,skA1)@i &  CurrentKeys(pk(skP1),pk(skA2))@j ==>
+         j<i
+"
+
+
+
+// The factory initiate a TEE with simply a linkable token
+rule create_TEE:
+     [Fr(~tokenL), Fr(~pid), Fr(~tokenU), Fr(~blinder),
+     !Skey(~skP,~skA),
+]--[PID(~pid),
+TEELState( ~pid, ~tokenL),
+CurrentKeys(pk(~skP),pk(~skA))
+]->[
+
+     TEETokenL( ~pid, ~tokenL), // linkable token init
+     TEETokenU(~pid, ~tokenU, unblind(sign(blind(~tokenU,~blinder),~skP),~blinder)),  // unlinkable token init
+      LinkableToken(~tokenL)]
+
+
+
+/////////////////////////////////
+// Linkable Token renewal ///////
+/////////////////////////////////
+
+
+
+// If the current unlinkable token of a TEE is deprecated, we can renew it using the linkable token. 
+rule Lchain0:
+  [!PKey(pkP,pkA),
+  TEETokenL( ~pid, ~tokenL),
+  TEETokenU(~pid,~tokenU, sigtok), 
+  Fr(~tls),
+  Fr(~newtoken),
+  Fr( ~blinder)
+  ]--[
+  CurrentKeys(pkP,pkA),
+   TEE(~pid),
+  NEq(checksign(sigtok,~tokenU,pkP),true) // this checks that the token is deprecated
+  ]->[
+ProviderAskLChain(~tls, <~pid,~tokenL, blind(~newtoken, ~blinder)>), // send to the provider the linkable token, and the blinded new token
+TEEL1( ~pid, ~tls, ~newtoken, ~blinder),
+  TEETokenL( ~pid, lchain(~tls)),
+  TEETokenU(~pid, lchain(~tls), 'chain')
+]
+
+rule Lchain2:
+[ ProviderAskLChain(tls,<~pid, ~tokenL, blinded>),
+LinkableToken(~tokenL), // verification and consumption of the linkable token
+!Skey(~skS,~skA),
+Fr(~ntokenL), // new linkable token
+]--[CurrentKeys(pk(~skS),pk(~skA)),
+ProviderAccept(~pid,~tokenL),
+ProviderAcceptLinkable(~pid,~tokenL)
+]->[
+ProviderAnswerLChain(tls, <~ntokenL, sign(blinded,~skS)> ),
+ LinkableToken(~ntokenL)
+]
+
+
+// Duplicate for the attacker interacting with the provider (can do if it knows a valid token!)
+rule Lchain_att:
+[ In(<~pid, ~tokenL, blinded>),
+LinkableToken(~tokenL), // verification and consumption of the linkable token
+!Skey(~skS,~skA),
+Fr(~ntokenL), // new linkable token
+]--[CurrentKeys(pk(~skS),pk(~skA))
+,
+ProviderAccept(~pid,~tokenL),
+AttUseLToken(~tokenL),
+ProviderAcceptAtt(),
+ProviderAcceptAttLinkable(),
+]->[
+Out(<~ntokenL, sign(blinded,~skS)> ),
+ LinkableToken(~ntokenL)
+]
+
+
+
+rule Lchain3:
+   let nsigtok=unblind(sblind,~blinder) in
+[!PKey(pkP,pkA),
+ProviderAnswerLChain(~tls, <~ntokL, sblind>),
+TEEL1( ~pid, ~tls, ~newtoken, ~blinder),
+  TEETokenL( ~pid, lchain(~tls)),
+  TEETokenU(~pid, lchain(~tls), 'chain')
+]--[
+Eq(checksign(nsigtok,~newtoken,pkP),true),
+ TEE(~pid),
+ TEERefresh(~pid),
+ TEEHeal(~pid),
+  TEEHealLinkable(~pid),
+TEEState( ~pid, ~newtoken, nsigtok),
+TEELState( ~pid, ~ntokL),
+ CurrentKeys(pkP,pkA)]->[
+  TEETokenL( ~pid, ~ntokL),
+  TEETokenU(~pid,~newtoken, nsigtok),  
+]
+
+
+///////////////////////////////////
+// UnLinkable Token renewal ///////
+///////////////////////////////////
+
+
+
+// We both authenticate using the token, renew the token at the same time and deliver an anonymous cert
+rule Uchain1:
+ [Fr(~tls),
+ !PKey(pkP,pkA),
+  TEETokenU(~pid,~token, sigtok),   
+ Fr(~newtoken), // new blind token
+ Fr(~blinder), // blinder
+ Fr(~skAT) // new AC key
+]--[
+ TTPAuth(~token,~pid),
+CurrentKeys(pkP,pkA),
+ TEE(~pid),
+Eq(checksign(sigtok,~token,pkP),true) // we only do the update if our unlinkable has not been deprecated through a key rollover.
+]->[
+
+ ProviderAskUChain( ~tls, ~token, sigtok, blind(~newtoken,~blinder), blind(pk(~skAT),~blinder)),
+ TEEU1(~tls,~pid, ~token, ~newtoken, ~blinder, ~skAT),
+   TEETokenU(~pid,uchain(~tls),  'uchain'),   
+ ] 
+
+
+rule Uchain2:
+[!Skey(~skP,~skA),
+ ProviderAskUChain( ~tls, ~token, sigtok, blindtok, blindcert),
+]--[
+CurrentKeys(pk(~skP),pk(~skA)),
+Eq(checksign(sigtok,~token,pk(~skP)),true), // is token valid
+Once(~token), // never used before?
+TTPAccept(~tls,~token),
+
+TTPAcceptS(~tls,~token, ~skP),
+
+Signed(blindtok)]->[
+ProviderAnswerUChain(~tls, sign(blindtok,~skP),sign(blindcert,~skA))
+]
+
+
+rule Uchain2_att:
+[!Skey(~skP,~skA),
+In(< ~token, sigtok, blindtok, blindcert>)
+]--[
+CurrentKeys(pk(~skP),pk(~skA)),
+Eq(checksign(sigtok,~token,pk(~skP)),true), // is token valid
+Once(~token), // never used before?
+TTPAccept('att',~token),
+
+TTPAcceptS('att',~token, ~skP),
+
+ProviderAcceptAtt(),
+Signed(blindtok)]->[
+Out(< sign(blindtok,~skP),sign(blindcert,~skA)>)
+]
+
+
+
+rule Uchain3:
+   let nsigtok=unblind(sigblindt,~blinder)
+      nsigcert=unblind(sigblindc,~blinder)
+in
+[!PKey(pkP,pkA),
+ TEEU1(~tls,~pid, ~token, ~newtoken, ~blinder, ~skAT),
+ProviderAnswerUChain(~tls, sigblindt,sigblindc),
+ TEETokenU(~pid,uchain(~tls),  'uchain'),   
+]--[
+TEEState( ~pid, ~newtoken, nsigtok),
+TEEAck(~pid,~token),
+ TEE(~pid),
+  TEEHeal(~pid),
+Eq(checksign(nsigtok,~newtoken,pkP),true),
+Eq(checksign(nsigcert,pk(~skAT),pkA),true),
+ CurrentKeys(pkP,pkA)
+]->[
+  TEETokenU(~pid,~newtoken, nsigtok),
+  !TEETokenCert(~pid,~skAT, nsigcert)  
+]
+
+
+
+
+
+rule tee_comp:
+ [
+ TEETokenL( ~pid, ~tokL),
+  TEETokenU(~pid,~token, sigtok)  
+ ]--[
+ TEEState( ~pid, ~token,  sigtok),
+ TEE(~pid),
+ Comp(~pid,~token),
+  CompF(~pid,~token,sigtok),
+  CompL(~pid,~tokL),
+ Once('comp')
+ ]->[
+ Out( < ~pid, ~token, sigtok,~tokL > ),
+ TEETokenL( ~pid, ~tokL),
+  TEETokenU(~pid,~token, sigtok) 
+
+ ]
+
+
+
+
+
+restriction verify:
+ "All m1 m2 #i. Eq(m1,m2)@i ==> m1=m2"
+
+
+restriction neq:
+ "All m1 m2 #i. NEq(m1,m2)@i ==> not(m1=m2)"
+
+
+
+restriction once:
+ "All #i #j x. Once(x)@i & Once(x)@j ==> #i=#j"
+
+
+restriction componce:
+ "All p t1 t2 #i #j. Comp(p,t1)@i & Comp(p,t2)@j ==> #i=#j"
+
+// lemma sigs[sources]:
+//  "All tok skey #i #j. MasterKey(skey)@i & KU(sign(tok,skey))@j ==> Ex blinder #k. Signed(blind(tok,blinder))@k"
+ 
+// lemma tee_state[sources]:
+//  "All r t  sigtok #i. TEEState(r,t,sigtok)@i ==> Ex sk #j. MasterKey(sk)@j & sigtok=sign(t,sk)"
+
+// Ex #j #k. Root(r)@j & Pair(t,tsk)@k"
+
+
+lemma tee_upid[reuse, heuristic=S]:
+  "All r #i #j. PID(r)@i & PID(r)@j ==> #i=#j"
+
+
+lemma tee_statestrong[sources]:
+  "All r t  sigtok #i. TEEState(r,t,sigtok)@i ==>
+  Ex skS bl. // skP // #j #k.
+//  Keys(skS,skP)@j &
+//   PID(r)@k &
+  sigtok=unblind(sign(blind(t,bl),skS),bl) "
+
+
+lemma loop_breaker[reuse,use_induction]:
+  "All r #i. TEE(r)@i ==>
+  Ex #k.  PID(r)@k "
+
+
+
+lemma mastersec[reuse]:
+ "not(Ex skS skP #i #j. Keys(skS,skP)@i & KU(skS)@j)"
+
+lemma mastersecbis[reuse]:
+ "not(Ex skS skP #i #j. Keys(skS,skP)@i & KU(skP)@j)"
+
+
+lemma sanity:
+exists-trace
+ "Ex chan pks #i. TTPAccept(chan,pks)@i"
+
+
+
+
+
+lemma tee_uniq[reuse, heuristic=S]:
+  "All r t1 #i #j. TEEAck(r,t1)@i & TEEAck(r,t1)@j ==> #i=#j"
+
+
+
+lemma tee_progress[use_induction,reuse]:
+ "All r t1 s1 t2 s2 #i #j. TEEState(r,t1,s1)@i & TEEState(r,t2,s2)@j & i < j & not(t1=t2)==>
+      (      (Ex tls #l. TTPAccept(tls,t1)@l & i<l & l < j & not(tls='att'))
+|
+	(Ex t #l. ProviderAccept(r,t)@l & i<l & l < j ))"
+induction
+  case empty_trace
+  by contradiction /* from formulas */
+next
+  case non_empty_trace
+  simplify
+  solve( (last(#j))  ∥ (t1 = t2)  ∥
+         (∃ tls #l.
+           (TTPAccept( tls, t1 ) @ #l)
+          ∧
+           (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #j) ∧ (¬(tls = 'att')))  ∥
+         (∃ t #l.
+           (ProviderAccept( r, t ) @ #l)
+          ∧
+           (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #j)) )
+    case case_1
+    solve( TEEState( r, t2, s2 ) @ #j )
+      case Lchain3
+      solve( ProviderAnswerLChain( ~tls,
+                                   <~ntokL, sign(blind(~newtoken, ~blinder), x)>
+             ) ▶₁ #j )
+        case Lchain2
+        solve( !PKey( pk(~skS), pkA ) ▶₀ #j )
+          case renew_ServerKey
+          solve( ProviderAskLChain( ~tls,
+                                    <~pid.1, ~tokenL.1, blind(~newtoken, ~blinder)>
+                 ) ▶₀ #vr )
+            case Lchain0_case_1
+            solve( TEEL1( ~pid, ~tls, ~newtoken, ~blinder ) ▶₂ #j )
+              case Lchain0
+              solve( TEETokenL( ~pid, lchain(~tls) ) ▶₃ #j )
+                case Lchain0
+                solve( TEETokenU( ~pid, lchain(~tls), 'chain' ) ▶₄ #j )
+                  case Lchain0
+                  solve( (#i = #vr)  ∥ (#vr < #i) )
+                    case case_1
+                    by solve( TEEState( ~pid, t1, s1 ) @ #i )
+                  next
+                    case case_2
+                    solve( TEEState( ~pid, t1, s1 ) @ #i )
+                      case Lchain3
+                      by contradiction /* cyclic */
+                    next
+                      case Uchain3
+                      by contradiction /* cyclic */
+                    next
+                      case tee_comp
+                      by contradiction /* cyclic */
+                    qed
+                  qed
+                qed
+              qed
+            qed
+          next
+            case Lchain0_case_2
+            solve( TEEL1( ~pid, ~tls, ~newtoken, ~blinder ) ▶₂ #j )
+              case Lchain0
+              solve( TEETokenL( ~pid, lchain(~tls) ) ▶₃ #j )
+                case Lchain0
+                solve( TEETokenU( ~pid, lchain(~tls), 'chain' ) ▶₄ #j )
+                  case Lchain0
+                  solve( TEEState( ~pid, t1, s1 ) @ #i )
+                    case Lchain3
+                    by contradiction /* cyclic */
+                  next
+                    case Uchain3
+                    by contradiction /* cyclic */
+                  next
+                    case tee_comp
+                    by contradiction /* cyclic */
+                  qed
+                qed
+              qed
+            qed
+          next
+            case Lchain0_case_3
+            solve( TEEL1( ~pid, ~tls, ~newtoken, ~blinder ) ▶₂ #j )
+              case Lchain0
+              solve( TEETokenL( ~pid, lchain(~tls) ) ▶₃ #j )
+                case Lchain0
+                solve( TEETokenU( ~pid, lchain(~tls), 'chain' ) ▶₄ #j )
+                  case Lchain0
+                  solve( TEEState( ~pid, t1, s1 ) @ #i )
+                    case Lchain3
+                    by contradiction /* cyclic */
+                  next
+                    case Uchain3
+                    by contradiction /* cyclic */
+                  next
+                    case tee_comp
+                    by contradiction /* cyclic */
+                  qed
+                qed
+              qed
+            qed
+          next
+            case Lchain0_case_4
+            solve( TEEL1( ~pid, ~tls, ~newtoken, ~blinder ) ▶₂ #j )
+              case Lchain0
+              solve( TEETokenL( ~pid, lchain(~tls) ) ▶₃ #j )
+                case Lchain0
+                solve( TEETokenU( ~pid, lchain(~tls), 'chain' ) ▶₄ #j )
+                  case Lchain0
+                  solve( TEEState( ~pid, t1, s1 ) @ #i )
+                    case Lchain3
+                    by contradiction /* cyclic */
+                  next
+                    case Uchain3
+                    by contradiction /* cyclic */
+                  next
+                    case tee_comp
+                    by contradiction /* cyclic */
+                  qed
+                qed
+              qed
+            qed
+          next
+            case Lchain0_case_5
+            solve( TEEL1( ~pid, ~tls, ~newtoken, ~blinder ) ▶₂ #j )
+              case Lchain0
+              solve( TEETokenL( ~pid, lchain(~tls) ) ▶₃ #j )
+                case Lchain0
+                solve( TEETokenU( ~pid, lchain(~tls), 'chain' ) ▶₄ #j )
+                  case Lchain0
+                  solve( TEEState( ~pid, t1, s1 ) @ #i )
+                    case Lchain3
+                    by contradiction /* cyclic */
+                  next
+                    case Uchain3
+                    by contradiction /* cyclic */
+                  next
+                    case tee_comp
+                    by contradiction /* cyclic */
+                  qed
+                qed
+              qed
+            qed
+          next
+            case Lchain0_case_6
+            solve( TEEL1( ~pid, ~tls, ~newtoken, ~blinder ) ▶₂ #j )
+              case Lchain0
+              solve( TEETokenL( ~pid, lchain(~tls) ) ▶₃ #j )
+                case Lchain0
+                solve( TEEState( ~pid, t1, s1 ) @ #i )
+                  case Lchain3
+                  by contradiction /* cyclic */
+                next
+                  case Uchain3
+                  solve( TEETokenU( ~pid, lchain(~tls.1), 'chain' ) ▶₄ #j )
+                    case Lchain0
+                    by contradiction /* cyclic */
+                  qed
+                next
+                  case tee_comp
+                  by contradiction /* cyclic */
+                qed
+              qed
+            qed
+          qed
+        qed
+      qed
+    next
+      case Uchain3
+      solve( ProviderAnswerUChain( ~tls,
+                                   sign(blind(~newtoken, ~blinder), x),
+                                   sign(blind(pk(~skAT), ~blinder), x.1)
+             ) ▶₂ #j )
+        case Uchain2
+        solve( TEEU1( ~tls, ~pid, ~token, ~newtoken, ~blinder, ~skAT
+               ) ▶₁ #j )
+          case Uchain1
+          solve( TEETokenU( ~pid, uchain(~tls), 'uchain' ) ▶₃ #j )
+            case Uchain1
+            solve( TEEState( ~pid, t1, s1 ) @ #i )
+              case Lchain3
+              solve( TEETokenU( ~pid, ~token,
+                                unblind(sign(blind(~token, x.1), ~skP), x.1)
+                     ) ▶₂ #vr.2 )
+                case Lchain3
+                solve( (#vr.3 = #i)  ∥ (#i < #vr.3)  ∥ (~token = ~newtoken)  ∥
+                       (∃ tls #l.
+                         (TTPAccept( tls, ~token ) @ #l)
+                        ∧
+                         (¬(last(#l))) ∧ (#vr.3 < #l) ∧ (#l < #i) ∧ (¬(tls = 'att')))  ∥
+                       (∃ t #l.
+                         (ProviderAccept( ~pid, t ) @ #l)
+                        ∧
+                         (¬(last(#l))) ∧ (#vr.3 < #l) ∧ (#l < #i)) )
+                  case case_1
+                  by contradiction /* from formulas */
+                next
+                  case case_2
+                  solve( (~newtoken = ~token)  ∥
+                         (∃ tls #l.
+                           (TTPAccept( tls, ~newtoken ) @ #l)
+                          ∧
+                           (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.3) ∧ (¬(tls = 'att')))  ∥
+                         (∃ t #l.
+                           (ProviderAccept( ~pid, t ) @ #l)
+                          ∧
+                           (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.3)) )
+                    case case_1
+                    by contradiction /* from formulas */
+                  next
+                    case case_2
+                    by contradiction /* from formulas */
+                  next
+                    case case_3
+                    by contradiction /* from formulas */
+                  qed
+                next
+                  case case_3
+                  by contradiction /* from formulas */
+                next
+                  case case_4
+                  by contradiction /* cyclic */
+                next
+                  case case_5
+                  by contradiction /* cyclic */
+                qed
+              next
+                case Uchain3
+                solve( (~newtoken = ~token)  ∥
+                       (∃ tls #l.
+                         (TTPAccept( tls, ~newtoken ) @ #l)
+                        ∧
+                         (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.3) ∧ (¬(tls = 'att')))  ∥
+                       (∃ t #l.
+                         (ProviderAccept( ~pid, t ) @ #l)
+                        ∧
+                         (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.3)) )
+                  case case_1
+                  by contradiction /* cyclic */
+                next
+                  case case_2
+                  by contradiction /* from formulas */
+                next
+                  case case_3
+                  by contradiction /* from formulas */
+                qed
+              next
+                case create_TEE
+                by contradiction /* cyclic */
+              next
+                case tee_comp
+                solve( (~newtoken = ~token)  ∥
+                       (∃ tls #l.
+                         (TTPAccept( tls, ~newtoken ) @ #l)
+                        ∧
+                         (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.3) ∧ (¬(tls = 'att')))  ∥
+                       (∃ t #l.
+                         (ProviderAccept( ~pid, t ) @ #l)
+                        ∧
+                         (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.3)) )
+                  case case_1
+                  by contradiction /* from formulas */
+                next
+                  case case_2
+                  by contradiction /* from formulas */
+                next
+                  case case_3
+                  by contradiction /* from formulas */
+                qed
+              qed
+            next
+              case Uchain3
+              solve( TEETokenU( ~pid, ~token.1,
+                                unblind(sign(blind(~token.1, x.2), ~skP), x.2)
+                     ) ▶₂ #vr.2 )
+                case Lchain3
+                solve( (~newtoken = ~token.1)  ∥
+                       (∃ tls #l.
+                         (TTPAccept( tls, ~newtoken ) @ #l)
+                        ∧
+                         (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.3) ∧ (¬(tls = 'att')))  ∥
+                       (∃ t #l.
+                         (ProviderAccept( ~pid, t ) @ #l)
+                        ∧
+                         (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.3)) )
+                  case case_1
+                  by contradiction /* from formulas */
+                next
+                  case case_2
+                  by contradiction /* from formulas */
+                next
+                  case case_3
+                  by contradiction /* from formulas */
+                qed
+              next
+                case Uchain3
+                solve( (#vr.3 = #i)  ∥ (#i < #vr.3)  ∥ (~token.1 = ~newtoken)  ∥
+                       (∃ tls #l.
+                         (TTPAccept( tls, ~token.1 ) @ #l)
+                        ∧
+                         (¬(last(#l))) ∧ (#vr.3 < #l) ∧ (#l < #i) ∧ (¬(tls = 'att')))  ∥
+                       (∃ t #l.
+                         (ProviderAccept( ~pid, t ) @ #l)
+                        ∧
+                         (¬(last(#l))) ∧ (#vr.3 < #l) ∧ (#l < #i)) )
+                  case case_1
+                  by contradiction /* from formulas */
+                next
+                  case case_2
+                  solve( (~newtoken = ~token.1)  ∥
+                         (∃ tls #l.
+                           (TTPAccept( tls, ~newtoken ) @ #l)
+                          ∧
+                           (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.3) ∧ (¬(tls = 'att')))  ∥
+                         (∃ t #l.
+                           (ProviderAccept( ~pid, t ) @ #l)
+                          ∧
+                           (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.3)) )
+                    case case_1
+                    by contradiction /* cyclic */
+                  next
+                    case case_2
+                    by contradiction /* from formulas */
+                  next
+                    case case_3
+                    by contradiction /* from formulas */
+                  qed
+                next
+                  case case_3
+                  by contradiction /* from formulas */
+                next
+                  case case_4
+                  by contradiction /* cyclic */
+                next
+                  case case_5
+                  by contradiction /* cyclic */
+                qed
+              next
+                case create_TEE
+                by contradiction /* cyclic */
+              next
+                case tee_comp
+                solve( (~newtoken = ~token.1)  ∥
+                       (∃ tls #l.
+                         (TTPAccept( tls, ~newtoken ) @ #l)
+                        ∧
+                         (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.3) ∧ (¬(tls = 'att')))  ∥
+                       (∃ t #l.
+                         (ProviderAccept( ~pid, t ) @ #l)
+                        ∧
+                         (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.3)) )
+                  case case_1
+                  by contradiction /* from formulas */
+                next
+                  case case_2
+                  by contradiction /* from formulas */
+                next
+                  case case_3
+                  by contradiction /* from formulas */
+                qed
+              qed
+            next
+              case tee_comp
+              solve( TEETokenU( ~pid, ~token.1,
+                                unblind(sign(blind(~token.1, x), ~skP), x)
+                     ) ▶₂ #vr.2 )
+                case Lchain3
+                solve( (~token = ~token.1)  ∥
+                       (∃ tls #l.
+                         (TTPAccept( tls, ~token ) @ #l)
+                        ∧
+                         (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.3) ∧ (¬(tls = 'att')))  ∥
+                       (∃ t #l.
+                         (ProviderAccept( ~pid, t ) @ #l)
+                        ∧
+                         (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.3)) )
+                  case case_1
+                  by contradiction /* from formulas */
+                next
+                  case case_2
+                  by contradiction /* from formulas */
+                next
+                  case case_3
+                  by contradiction /* from formulas */
+                qed
+              next
+                case Uchain3
+                solve( (~token = ~token.1)  ∥
+                       (∃ tls #l.
+                         (TTPAccept( tls, ~token ) @ #l)
+                        ∧
+                         (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.3) ∧ (¬(tls = 'att')))  ∥
+                       (∃ t #l.
+                         (ProviderAccept( ~pid, t ) @ #l)
+                        ∧
+                         (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.3)) )
+                  case case_1
+                  by contradiction /* cyclic */
+                next
+                  case case_2
+                  by contradiction /* from formulas */
+                next
+                  case case_3
+                  by contradiction /* from formulas */
+                qed
+              next
+                case create_TEE
+                by contradiction /* cyclic */
+              next
+                case tee_comp
+                by contradiction /* from formulas */
+              qed
+            qed
+          qed
+        qed
+      qed
+    next
+      case tee_comp
+      solve( TEETokenU( ~pid, ~token, s2 ) ▶₁ #j )
+        case Lchain3
+        solve( TEEState( ~pid, t1, s1 ) @ #i )
+          case Lchain3
+          solve( (#vr = #i)  ∥ (#i < #vr)  ∥ (~token = ~newtoken)  ∥
+                 (∃ tls #l.
+                   (TTPAccept( tls, ~token ) @ #l)
+                  ∧
+                   (¬(last(#l))) ∧ (#vr < #l) ∧ (#l < #i) ∧ (¬(tls = 'att')))  ∥
+                 (∃ t #l.
+                   (ProviderAccept( ~pid, t ) @ #l)
+                  ∧
+                   (¬(last(#l))) ∧ (#vr < #l) ∧ (#l < #i)) )
+            case case_1
+            by contradiction /* from formulas */
+          next
+            case case_2
+            solve( (~newtoken = ~token)  ∥
+                   (∃ tls #l.
+                     (TTPAccept( tls, ~newtoken ) @ #l)
+                    ∧
+                     (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr) ∧ (¬(tls = 'att')))  ∥
+                   (∃ t #l.
+                     (ProviderAccept( ~pid, t ) @ #l)
+                    ∧
+                     (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr)) )
+              case case_1
+              by contradiction /* from formulas */
+            next
+              case case_2
+              by contradiction /* from formulas */
+            next
+              case case_3
+              by contradiction /* from formulas */
+            qed
+          next
+            case case_3
+            by contradiction /* from formulas */
+          next
+            case case_4
+            by contradiction /* cyclic */
+          next
+            case case_5
+            by contradiction /* cyclic */
+          qed
+        next
+          case Uchain3
+          solve( (~newtoken = ~token.1)  ∥
+                 (∃ tls #l.
+                   (TTPAccept( tls, ~newtoken ) @ #l)
+                  ∧
+                   (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr) ∧ (¬(tls = 'att')))  ∥
+                 (∃ t #l.
+                   (ProviderAccept( ~pid, t ) @ #l)
+                  ∧
+                   (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr)) )
+            case case_1
+            by contradiction /* from formulas */
+          next
+            case case_2
+            by contradiction /* from formulas */
+          next
+            case case_3
+            by contradiction /* from formulas */
+          qed
+        next
+          case tee_comp
+          by contradiction /* cyclic */
+        qed
+      next
+        case Uchain3
+        solve( (#vr = #i)  ∥ (#i < #vr)  ∥ (~token = t1)  ∥
+               (∃ tls #l.
+                 (TTPAccept( tls, ~token ) @ #l)
+                ∧
+                 (¬(last(#l))) ∧ (#vr < #l) ∧ (#l < #i) ∧ (¬(tls = 'att')))  ∥
+               (∃ t #l.
+                 (ProviderAccept( ~pid, t ) @ #l)
+                ∧
+                 (¬(last(#l))) ∧ (#vr < #l) ∧ (#l < #i)) )
+          case case_1
+          solve( !Skey( ~skP.1, ~skA.1 ) ▶₄ #k )
+            case renew_ServerKey
+            solve( TEEState( ~pid, t1, s1 ) @ #i )
+              case Uchain3
+              by contradiction /* from formulas */
+            qed
+          qed
+        next
+          case case_2
+          solve( (t1 = ~token)  ∥
+                 (∃ tls #l.
+                   (TTPAccept( tls, t1 ) @ #l)
+                  ∧
+                   (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr) ∧ (¬(tls = 'att')))  ∥
+                 (∃ t #l.
+                   (ProviderAccept( ~pid, t ) @ #l)
+                  ∧
+                   (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr)) )
+            case case_1
+            by contradiction /* from formulas */
+          next
+            case case_2
+            by contradiction /* from formulas */
+          next
+            case case_3
+            by contradiction /* from formulas */
+          qed
+        next
+          case case_3
+          by contradiction /* from formulas */
+        next
+          case case_4
+          solve( !Skey( ~skP.1, ~skA ) ▶₄ #k )
+            case renew_ServerKey
+            solve( TEEState( ~pid, t1, s1 ) @ #i )
+              case Lchain3
+              by contradiction /* cyclic */
+            next
+              case Uchain3
+              by contradiction /* cyclic */
+            next
+              case tee_comp
+              by contradiction /* cyclic */
+            qed
+          qed
+        next
+          case case_5
+          solve( !Skey( ~skP.1, ~skA ) ▶₄ #k )
+            case renew_ServerKey
+            solve( TEEState( ~pid, t1, s1 ) @ #i )
+              case Lchain3
+              by contradiction /* cyclic */
+            next
+              case Uchain3
+              by contradiction /* cyclic */
+            next
+              case tee_comp
+              by contradiction /* cyclic */
+            qed
+          qed
+        qed
+      next
+        case create_TEE
+        solve( TEEState( ~pid, t1, s1 ) @ #i )
+          case Lchain3
+          by contradiction /* cyclic */
+        next
+          case Uchain3
+          by contradiction /* cyclic */
+        next
+          case tee_comp
+          by contradiction /* cyclic */
+        qed
+      next
+        case tee_comp
+        by contradiction /* cyclic */
+      qed
+    qed
+  next
+    case case_2
+    by contradiction /* from formulas */
+  next
+    case case_3
+    by contradiction /* from formulas */
+  next
+    case case_4
+    by contradiction /* from formulas */
+  qed
+qed
+
+// ok up to here
+
+lemma tee_state[use_induction,reuse]:
+  "All r t  sigtok #i. TEEState(r,t,sigtok)@i ==> Ex #j. PID(r)@j"
+
+lemma tee_progressL [use_induction, reuse]:
+  all-traces
+  "∀ r t1 t2 #i #j.
+    ((((TEELState( r, t1 ) @ #i) ∧ (TEELState( r, t2 ) @ #j)) ∧
+      (#i < #j)) ∧
+     (¬(t1 = t2))) ⇒
+    (∃ #l.
+      ((ProviderAcceptLinkable( r, t1 ) @ #l) ∧ (#i < #l)) ∧ (#l < #j))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ r t1 t2 #i #j.
+  (TEELState( r, t1 ) @ #i) ∧ (TEELState( r, t2 ) @ #j)
+ ∧
+  (#i < #j) ∧
+  (¬(t1 = t2)) ∧
+  (∀ #l.
+    (ProviderAcceptLinkable( r, t1 ) @ #l)
+   ⇒
+    ((¬(#i < #l)) ∨ (¬(#l < #j))))"
+*/
+induction
+  case empty_trace
+  by contradiction
+next
+  case non_empty_trace
+  simplify
+  solve( TEELState( r, t2 ) @ #j )
+    case Lchain3
+    solve( TEELState( ~pid, t1 ) @ #i )
+      case Lchain3
+      solve( TEETokenL( ~pid, lchain(~tls.1) ) ▶₃ #j )
+        case Lchain0_case_1
+        by contradiction
+      next
+        case Lchain0_case_2
+        by contradiction
+      next
+        case Lchain0_case_3
+        solve( TEEL1( ~pid, ~tls.1, ~newtoken.1, ~blinder.1 ) ▶₂ #j )
+          case Lchain0
+          solve( TEETokenU( ~pid, lchain(~tls.1), 'chain' ) ▶₄ #j )
+            case Lchain0
+            solve( ProviderAnswerLChain( ~tls.1,
+                                         <~ntokL.1, sign(blind(~newtoken.1, ~blinder.1), x.1)>
+                   ) ▶₁ #j )
+              case Lchain2
+              solve( ProviderAskLChain( ~tls.1,
+                                        <~pid.3, ~tokenL.4, blind(~newtoken.1, ~blinder.1)>
+                     ) ▶₀ #vr.8 )
+                case Lchain0
+                solve( (#vr.2 = #i)  ∥ (#i < #vr.2)  ∥ (~tokenL.1 = ~ntokL)  ∥
+                       (∃ #l.
+                         (ProviderAcceptLinkable( ~pid, ~tokenL.1 ) @ #l)
+                        ∧
+                         (¬(last(#l))) ∧ (#vr.2 < #l) ∧ (#l < #i)) )
+                  case case_1
+                  by contradiction
+                next
+                  case case_2
+                  solve( (#vr.3 = #i)  ∥ (#i < #vr.3)  ∥ (~ntokL.2 = ~ntokL)  ∥
+                         (∃ #l.
+                           (ProviderAcceptLinkable( ~pid, ~ntokL.2 ) @ #l)
+                          ∧
+                           (¬(last(#l))) ∧ (#vr.3 < #l) ∧ (#l < #i)) )
+                    case case_1
+                    by contradiction
+                  next
+                    case case_2
+                    solve( (~ntokL = ~ntokL.2)  ∥
+                           (∃ #l.
+                             (ProviderAcceptLinkable( ~pid, ~ntokL ) @ #l)
+                            ∧
+                             (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.3)) )
+                      case case_1
+                      solve( (~ntokL = ~tokenL.1)  ∥
+                             (∃ #l.
+                               (ProviderAcceptLinkable( ~pid, ~ntokL ) @ #l)
+                              ∧
+                               (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.2)) )
+                        case case_1
+                        by contradiction
+                      next
+                        case case_2
+                        by contradiction
+                      qed
+                    next
+                      case case_2
+                      by contradiction
+                    qed
+                  next
+                    case case_3
+                    solve( (~ntokL = ~tokenL.1)  ∥
+                           (∃ #l.
+                             (ProviderAcceptLinkable( ~pid, ~ntokL ) @ #l)
+                            ∧
+                             (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.2)) )
+                      case case_1
+                      by contradiction
+                    next
+                      case case_2
+                      by contradiction
+                    qed
+                  next
+                    case case_4
+                    by contradiction
+                  qed
+                next
+                  case case_3
+                  by contradiction
+                next
+                  case case_4
+                  by contradiction
+                qed
+              qed
+            qed
+          qed
+        qed
+      next
+        case Lchain0_case_4
+        solve( (#i = #vr.2)  ∥ (#vr.2 < #i)  ∥ (~ntokL = ~tokenL.1)  ∥
+               (∃ #l.
+                 (ProviderAcceptLinkable( ~pid, ~ntokL ) @ #l)
+                ∧
+                 (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.2)) )
+          case case_1
+          solve( ProviderAnswerLChain( ~tls.1,
+                                       <~ntokL.1, sign(blind(~newtoken.1, ~blinder.1), x)>
+                 ) ▶₁ #j )
+            case Lchain2
+            solve( ProviderAskLChain( ~tls.1,
+                                      <~pid.2, ~tokenL.2, blind(~newtoken.1, ~blinder.1)>
+                   ) ▶₀ #vr.8 )
+              case Lchain0
+              by contradiction
+            qed
+          qed
+        next
+          case case_2
+          by contradiction
+        next
+          case case_3
+          solve( ProviderAnswerLChain( ~tls.1,
+                                       <~ntokL.1, sign(blind(~newtoken.1, ~blinder.1), x.1)>
+                 ) ▶₁ #j )
+            case Lchain2
+            solve( ProviderAskLChain( ~tls.1,
+                                      <~pid.2, ~tokenL.2, blind(~newtoken.1, ~blinder.1)>
+                   ) ▶₀ #vr.9 )
+              case Lchain0
+              by contradiction
+            qed
+          qed
+        next
+          case case_4
+          by contradiction
+        qed
+      next
+        case Lchain0_case_5
+        solve( ProviderAnswerLChain( ~tls.1,
+                                     <~ntokL.1, sign(blind(~newtoken.1, ~blinder.1), x.1)>
+               ) ▶₁ #j )
+          case Lchain2
+          solve( ProviderAskLChain( ~tls.1,
+                                    <~pid.1, ~tokenL.2, blind(~newtoken.1, ~blinder.1)>
+                 ) ▶₀ #vr.7 )
+            case Lchain0
+            solve( TEETokenL( ~pid, ~tokenL.1 ) ▶₀ #vr.2 )
+              case Lchain3
+              solve( (#vr.9 = #i)  ∥ (#i < #vr.9)  ∥ (~tokenL.1 = ~ntokL)  ∥
+                     (∃ #l.
+                       (ProviderAcceptLinkable( ~pid, ~tokenL.1 ) @ #l)
+                      ∧
+                       (¬(last(#l))) ∧ (#vr.9 < #l) ∧ (#l < #i)) )
+                case case_1
+                by contradiction /* from formulas */
+              next
+                case case_2
+                solve( (~ntokL = ~tokenL.1)  ∥
+                       (∃ #l.
+                         (ProviderAcceptLinkable( ~pid, ~ntokL ) @ #l)
+                        ∧
+                         (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.9)) )
+                  case case_1
+                  by contradiction /* from formulas */
+                next
+                  case case_2
+                  by contradiction /* from formulas */
+                qed
+              next
+                case case_3
+                by contradiction /* from formulas */
+              next
+                case case_4
+                by contradiction /* cyclic */
+              qed
+            next
+              case create_TEE
+              by contradiction /* cyclic */
+            qed
+          qed
+        qed
+      next
+        case Lchain0_case_6
+        solve( TEETokenL( ~pid, ~tokenL.1 ) ▶₀ #vr.2 )
+          case Lchain3
+          solve( (#vr.3 = #i)  ∥ (#i < #vr.3)  ∥ (~tokenL.1 = ~ntokL)  ∥
+                 (∃ #l.
+                   (ProviderAcceptLinkable( ~pid, ~tokenL.1 ) @ #l)
+                  ∧
+                   (¬(last(#l))) ∧ (#vr.3 < #l) ∧ (#l < #i)) )
+            case case_1
+            solve( ProviderAnswerLChain( ~tls.1,
+                                         <~ntokL.1, sign(blind(~newtoken.1, ~blinder.1), x)>
+                   ) ▶₁ #j )
+              case Lchain2
+              solve( ProviderAskLChain( ~tls.1,
+                                        <~pid.2, ~tokenL.2, blind(~newtoken.1, ~blinder.1)>
+                     ) ▶₀ #vr.5 )
+                case Lchain0
+                by contradiction /* from formulas */
+              qed
+            qed
+          next
+            case case_2
+            solve( (~ntokL = ~tokenL.1)  ∥
+                   (∃ #l.
+                     (ProviderAcceptLinkable( ~pid, ~ntokL ) @ #l)
+                    ∧
+                     (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.3)) )
+              case case_1
+              solve( ProviderAnswerLChain( ~tls,
+                                           <~ntokL, sign(blind(~newtoken, ~blinder), x)>
+                     ) ▶₁ #i )
+                case Lchain2
+                by contradiction /* cyclic */
+              qed
+            next
+              case case_2
+              by contradiction /* from formulas */
+            qed
+          next
+            case case_3
+            solve( ProviderAnswerLChain( ~tls,
+                                         <~ntokL, sign(blind(~newtoken, ~blinder), x)>
+                   ) ▶₁ #i )
+              case Lchain2
+              solve( splitEqs(4) )
+                case split_case_1
+                solve( ProviderAnswerLChain( ~tls.1,
+                                             <~ntokL.1, sign(blind(~newtoken.1, ~blinder.1), x)>
+                       ) ▶₁ #j )
+                  case Lchain2
+                  solve( ProviderAskLChain( ~tls.1,
+                                            <~pid.2, ~tokenL.2, blind(~newtoken.1, ~blinder.1)>
+                         ) ▶₀ #vr.5 )
+                    case Lchain0
+                    by contradiction /* from formulas */
+                  qed
+                qed
+              next
+                case split_case_2
+                by contradiction /* from formulas */
+              qed
+            qed
+          next
+            case case_4
+            by contradiction /* cyclic */
+          qed
+        next
+          case create_TEE
+          by contradiction
+        qed
+      qed
+    next
+      case create_TEE
+      solve( TEEL1( ~pid, ~tls, ~newtoken, ~blinder.1 ) ▶₂ #j )
+        case Lchain0_case_1
+        solve( TEETokenL( ~pid, lchain(~tls) ) ▶₃ #j )
+          case Lchain0
+          solve( splitEqs(4) )
+            case split_case_1
+            solve( ProviderAnswerLChain( ~tls,
+                                         <~ntokL, sign(blind(~newtoken, ~blinder.1), x)>
+                   ) ▶₁ #j )
+              case Lchain2
+              solve( ProviderAskLChain( ~tls,
+                                        <~pid.1, ~tokenL.1, blind(~newtoken, ~blinder.1)>
+                     ) ▶₀ #vr.3 )
+                case Lchain0
+                by contradiction /* from formulas */
+              qed
+            qed
+          next
+            case split_case_2
+            by contradiction /* from formulas */
+          qed
+        qed
+      next
+        case Lchain0_case_2
+        solve( splitEqs(4) )
+          case split_case_1
+          solve( ProviderAnswerLChain( ~tls,
+                                       <~ntokL, sign(blind(~newtoken, ~blinder.1), x)>
+                 ) ▶₁ #j )
+            case Lchain2
+            solve( ProviderAskLChain( ~tls,
+                                      <~pid.1, ~tokenL.1, blind(~newtoken, ~blinder.1)>
+                   ) ▶₀ #vr.7 )
+              case Lchain0
+              by contradiction /* from formulas */
+            qed
+          qed
+        next
+          case split_case_2
+          by contradiction /* from formulas */
+        qed
+      next
+        case Lchain0_case_3
+        solve( ProviderAnswerLChain( ~tls,
+                                     <~ntokL, sign(blind(~newtoken, ~blinder.1), x)>
+               ) ▶₁ #j )
+          case Lchain2
+          solve( ProviderAskLChain( ~tls,
+                                    <~pid.3, ~tokenL.4, blind(~newtoken, ~blinder.1)>
+                 ) ▶₀ #vr.8 )
+            case Lchain0
+            solve( splitEqs(4) )
+              case split_case_1
+              solve( (~tokenL = ~tokenL.1)  ∥
+                     (∃ #l.
+                       (ProviderAcceptLinkable( ~pid, ~tokenL ) @ #l)
+                      ∧
+                       (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.2)) )
+                case case_2
+                by contradiction /* from formulas */
+              qed
+            next
+              case split_case_2
+              by contradiction /* from formulas */
+            qed
+          qed
+        qed
+      next
+        case Lchain0_case_4
+        solve( (~tokenL = ~tokenL.1)  ∥
+               (∃ #l.
+                 (ProviderAcceptLinkable( ~pid, ~tokenL ) @ #l)
+                ∧
+                 (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.2)) )
+          case case_2
+          by contradiction /* from formulas */
+        qed
+      next
+        case Lchain0_case_5
+        solve( ProviderAnswerLChain( ~tls,
+                                     <~ntokL, sign(blind(~newtoken, ~blinder.1), x)>
+               ) ▶₁ #j )
+          case Lchain2
+          solve( ProviderAskLChain( ~tls,
+                                    <~pid.1, ~tokenL.2, blind(~newtoken, ~blinder.1)>
+                 ) ▶₀ #vr.7 )
+            case Lchain0
+            solve( splitEqs(4) )
+              case split_case_1
+              solve( TEETokenL( ~pid, lchain(~tls) ) ▶₃ #j )
+                case Lchain0
+                solve( TEETokenL( ~pid, ~tokenL.1 ) ▶₀ #vr.2 )
+                  case Lchain3
+                  solve( (~tokenL = ~tokenL.1)  ∥
+                         (∃ #l.
+                           (ProviderAcceptLinkable( ~pid, ~tokenL ) @ #l)
+                          ∧
+                           (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.9)) )
+                    case case_2
+                    by contradiction /* from formulas */
+                  qed
+                next
+                  case create_TEE
+                  by contradiction /* from formulas */
+                qed
+              qed
+            next
+              case split_case_2
+              by contradiction /* from formulas */
+            qed
+          qed
+        qed
+      next
+        case Lchain0_case_6
+        solve( ProviderAnswerLChain( ~tls,
+                                     <~ntokL, sign(blind(~newtoken, ~blinder.1), x)>
+               ) ▶₁ #j )
+          case Lchain2
+          solve( splitEqs(4) )
+            case split_case_1
+            solve( TEETokenL( ~pid, lchain(~tls) ) ▶₃ #j )
+              case Lchain0
+              solve( ProviderAskLChain( ~tls,
+                                        <~pid.1, ~tokenL.2, blind(~newtoken, ~blinder.1)>
+                     ) ▶₀ #vr.3 )
+                case Lchain0
+                solve( TEETokenL( ~pid, ~tokenL.1 ) ▶₀ #vr.2 )
+                  case Lchain3
+                  solve( (~tokenL = ~tokenL.1)  ∥
+                         (∃ #l.
+                           (ProviderAcceptLinkable( ~pid, ~tokenL ) @ #l)
+                          ∧
+                           (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.5)) )
+                    case case_2
+                    by contradiction /* from formulas */
+                  qed
+                next
+                  case create_TEE
+                  by contradiction /* from formulas */
+                qed
+              qed
+            qed
+          next
+            case split_case_2
+            by contradiction /* from formulas */
+          qed
+        qed
+      qed
+    qed
+  next
+    case create_TEE
+    solve( TEELState( ~pid, t1 ) @ #i )
+      case Lchain3
+      by contradiction /* cyclic */
+    next
+      case create_TEE
+      by contradiction /* cyclic */
+    qed
+  qed
+qed
+
+lemma ltok_uniq [reuse]:
+  all-traces
+  "∀ p1 t p2 #i #j.
+    ((ProviderAccept( p1, t ) @ #i) ∧ (ProviderAccept( p2, t ) @ #j)) ⇒
+    ((p1 = p2) ∧ (#i = #j))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ p1 t p2 #i #j.
+  (ProviderAccept( p1, t ) @ #i) ∧ (ProviderAccept( p2, t ) @ #j)
+ ∧
+  ((¬(p1 = p2)) ∨ (¬(#i = #j)))"
+*/
+simplify
+solve( ProviderAccept( p1, t ) @ #i )
+  case Lchain2
+  solve( LinkableToken( ~tokenL ) ▶₁ #i )
+    case Lchain2
+    solve( ProviderAccept( p2, ~tokenL ) @ #j )
+      case Lchain2
+      solve( LinkableToken( ~tokenL ) ▶₁ #j )
+        case Lchain2
+        by contradiction
+      qed
+    next
+      case Lchain_att
+      by solve( LinkableToken( ~tokenL ) ▶₁ #j )
+    qed
+  next
+    case Lchain_att
+    solve( ProviderAccept( p2, ~tokenL ) @ #j )
+      case Lchain2
+      solve( LinkableToken( ~tokenL ) ▶₁ #j )
+        case Lchain_att
+        by contradiction
+      qed
+    next
+      case Lchain_att
+      by solve( LinkableToken( ~tokenL ) ▶₁ #j )
+    qed
+  next
+    case create_TEE
+    solve( ProviderAccept( p2, ~tokenL ) @ #j )
+      case Lchain2
+      solve( LinkableToken( ~tokenL ) ▶₁ #j )
+        case create_TEE
+        by contradiction
+      qed
+    next
+      case Lchain_att
+      by solve( LinkableToken( ~tokenL ) ▶₁ #j )
+    qed
+  qed
+next
+  case Lchain_att
+  solve( ProviderAccept( p2, ~tokenL ) @ #j )
+    case Lchain2
+    solve( LinkableToken( ~tokenL ) ▶₁ #i )
+      case Lchain2
+      by solve( LinkableToken( ~tokenL ) ▶₁ #j )
+    next
+      case Lchain_att
+      by solve( LinkableToken( ~tokenL ) ▶₁ #j )
+    next
+      case create_TEE
+      by solve( LinkableToken( ~tokenL ) ▶₁ #j )
+    qed
+  next
+    case Lchain_att
+    solve( LinkableToken( ~tokenL ) ▶₁ #i )
+      case Lchain2
+      solve( LinkableToken( ~tokenL ) ▶₁ #j )
+        case Lchain2
+        by contradiction
+      qed
+    next
+      case Lchain_att
+      solve( LinkableToken( ~tokenL ) ▶₁ #j )
+        case Lchain_att
+        by contradiction
+      qed
+    next
+      case create_TEE
+      solve( LinkableToken( ~tokenL ) ▶₁ #j )
+        case create_TEE
+        by contradiction
+      qed
+    qed
+  qed
+qed
+
+lemma authAttPCSLfirst [use_induction, reuse, hide_lemma=authAtt]:
+  all-traces
+  "∀ tok #i.
+    (AttUseLToken( tok ) @ #i) ⇒
+    ((∃ t1 pid #j #l.
+       ((((CompL( pid, t1 ) @ #j) ∧ (#j < #i)) ∧
+         (AttUseLToken( t1 ) @ #l)) ∧
+        (#j < #l)) ∧
+       (∀ #k. (TEEHealLinkable( pid ) @ #k) ⇒ ((#k < #j) ∧ (#k < #i)))) ∨
+     (∃ pid #j.
+       ((CompL( pid, tok ) @ #j) ∧ (#j < #i)) ∧
+       (∀ #k. (TEEHealLinkable( pid ) @ #k) ⇒ ((#k < #j) ∧ (#k < #i)))))"
+/*
+guarded formula characterizing all counter-examples:
+"∃ tok #i.
+  (AttUseLToken( tok ) @ #i)
+ ∧
+  (∀ t1 pid #j #l.
+    (CompL( pid, t1 ) @ #j) ∧ (AttUseLToken( t1 ) @ #l)
+   ⇒
+    ((¬(#j < #i)) ∨
+     (¬(#j < #l)) ∨
+     (∃ #k.
+       (TEEHealLinkable( pid ) @ #k) ∧ ((¬(#k < #j)) ∨ (¬(#k < #i)))))) ∧
+  (∀ pid #j.
+    (CompL( pid, tok ) @ #j)
+   ⇒
+    ((¬(#j < #i)) ∨
+     (∃ #k.
+       (TEEHealLinkable( pid ) @ #k) ∧ ((¬(#k < #j)) ∨ (¬(#k < #i))))))"
+*/
+induction
+  case empty_trace
+  by contradiction
+next
+  case non_empty_trace
+  simplify
+  solve( !KU( ~tokenL ) @ #vk.3 )
+    case Lchain_att
+    solve( (∃ t1 pid #j #l.
+             (CompL( pid, t1 ) @ #j) ∧ (AttUseLToken( t1 ) @ #l)
+            ∧
+             (¬(last(#l))) ∧
+             (¬(last(#j))) ∧
+             (#j < #vr) ∧
+             (#j < #l) ∧
+             (∀ #k.
+               (TEEHealLinkable( pid ) @ #k)
+              ⇒
+               ((last(#k)) ∨ ((#k < #j) ∧ (#k < #vr)))))  ∥
+           (∃ pid #j.
+             (CompL( pid, ~tokenL.1 ) @ #j)
+            ∧
+             (¬(last(#j))) ∧
+             (#j < #vr) ∧
+             (∀ #k.
+               (TEEHealLinkable( pid ) @ #k)
+              ⇒
+               ((last(#k)) ∨ ((#k < #j) ∧ (#k < #vr))))) )
+      case case_1
+      solve( (¬(#k.1 < #j))  ∥ (¬(#k.1 < #i)) )
+        case case_1
+        solve( TEETokenL( ~pid.1, ~tokL ) ▶₀ #j )
+          case Lchain3
+          solve( (~tokenL.1 = ~tokL)  ∥
+                 (∃ #l.
+                   (ProviderAcceptLinkable( ~pid.1, ~tokenL.1 ) @ #l)
+                  ∧
+                   (#k < #l) ∧ (#l < #vr.3)) )
+            case case_2
+            solve( (~tokL = ~ntokL)  ∥
+                   (∃ #l.
+                     (ProviderAcceptLinkable( ~pid.1, ~tokL ) @ #l)
+                    ∧
+                     (#vr.3 < #l) ∧ (#l < #last)) )
+              case case_1
+              solve( ProviderAnswerLChain( ~tls,
+                                           <~ntokL, sign(blind(~newtoken, ~blinder.1), x)>
+                     ) ▶₁ #last )
+                case Lchain2
+                by contradiction /* cyclic */
+              qed
+            qed
+          qed
+        next
+          case create_TEE
+          solve( (~tokL = ~ntokL)  ∥
+                 (∃ #l.
+                   (ProviderAcceptLinkable( ~pid.1, ~tokL ) @ #l)
+                  ∧
+                   (#k < #l) ∧ (#l < #last)) )
+            case case_1
+            by solve( ProviderAnswerLChain( ~tls,
+                                            <~ntokL, sign(blind(~newtoken, ~blinder.1), x)>
+                      ) ▶₁ #last )
+          qed
+        next
+          case tee_comp
+          by contradiction /* cyclic */
+        qed
+      next
+        case case_2
+        solve( TEETokenL( ~pid.1, ~tokL ) ▶₀ #j )
+          case Lchain3
+          solve( (~tokL = ~ntokL)  ∥
+                 (∃ #l.
+                   (ProviderAcceptLinkable( ~pid.1, ~tokL ) @ #l)
+                  ∧
+                   (#vr.3 < #l) ∧ (#l < #last)) )
+            case case_1
+            solve( ProviderAnswerLChain( ~tls,
+                                         <~ntokL, sign(blind(~newtoken, ~blinder.1), x)>
+                   ) ▶₁ #last )
+              case Lchain2
+              by contradiction /* cyclic */
+            qed
+          qed
+        next
+          case create_TEE
+          solve( (~tokL = ~ntokL)  ∥
+                 (∃ #l.
+                   (ProviderAcceptLinkable( ~pid.1, ~tokL ) @ #l)
+                  ∧
+                   (#k < #l) ∧ (#l < #last)) )
+            case case_1
+            by solve( ProviderAnswerLChain( ~tls,
+                                            <~ntokL, sign(blind(~newtoken, ~blinder.1), x)>
+                      ) ▶₁ #last )
+          qed
+        next
+          case tee_comp
+          by contradiction /* cyclic */
+        qed
+      qed
+    next
+      case case_2
+      solve( (¬(#k.1 < #j))  ∥ (¬(#k.1 < #i)) )
+        case case_1
+        solve( TEETokenL( ~pid.1, ~tokenL.1 ) ▶₀ #j )
+          case Lchain3
+          solve( (~tokenL.1 = ~ntokL)  ∥
+                 (∃ #l.
+                   (ProviderAcceptLinkable( ~pid.1, ~tokenL.1 ) @ #l)
+                  ∧
+                   (#vr.3 < #l) ∧ (#l < #last)) )
+            case case_1
+            solve( ProviderAnswerLChain( ~tls,
+                                         <~ntokL, sign(blind(~newtoken, ~blinder.1), x)>
+                   ) ▶₁ #last )
+              case Lchain2
+              by contradiction /* cyclic */
+            qed
+          qed
+        next
+          case create_TEE
+          solve( ProviderAnswerLChain( ~tls,
+                                       <~ntokL, sign(blind(~newtoken, ~blinder.1), x)>
+                 ) ▶₁ #last )
+            case Lchain2
+            by solve( (~tokenL.1 = ~ntokL)  ∥
+                      (∃ #l.
+                        (ProviderAcceptLinkable( ~pid.1, ~tokenL.1 ) @ #l)
+                       ∧
+                        (#k < #l) ∧ (#l < #last)) )
+          qed
+        next
+          case tee_comp
+          by contradiction /* cyclic */
+        qed
+      next
+        case case_2
+        solve( (~tokenL.2 = ~ntokL)  ∥
+               (∃ #l.
+                 (ProviderAcceptLinkable( ~pid.1, ~tokenL.2 ) @ #l)
+                ∧
+                 (#k < #l) ∧ (#l < #last)) )
+          case case_1
+          by solve( ProviderAnswerLChain( ~tls,
+                                          <~ntokL, sign(blind(~newtoken, ~blinder.1), x)>
+                    ) ▶₁ #last )
+        next
+          case case_2
+          solve( ProviderAnswerLChain( ~tls,
+                                       <~ntokL, sign(blind(~newtoken, ~blinder.1), x)>
+                 ) ▶₁ #last )
+            case Lchain2
+            solve( TEETokenL( ~pid.1, ~tokenL.1 ) ▶₀ #j )
+              case Lchain3
+              solve( (~tokenL.1 = ~ntokL)  ∥
+                     (∃ #l.
+                       (ProviderAcceptLinkable( ~pid.1, ~tokenL.1 ) @ #l)
+                      ∧
+                       (#vr.5 < #l) ∧ (#l < #last)) )
+                case case_1
+                by contradiction /* cyclic */
+              qed
+            next
+              case tee_comp
+              by contradiction /* cyclic */
+            qed
+          qed
+        qed
+      qed
+    qed
+  next
+    case fresh
+    by solve( LinkableToken( ~tokenL ) ▶₁ #i )
+  next
+    case tee_comp_case_1
+    by solve( LinkableToken( ~tokenL ) ▶₁ #i )
+  next
+    case tee_comp_case_2
+    solve( TEETokenU( ~pid.1, ~tokenL,
+                      unblind(sign(blind(~tokenL, bl), skS.1), bl)
+           ) ▶₁ #vr )
+      case Lchain3
+      solve( LinkableToken( ~tokenL ) ▶₁ #i )
+        case Lchain2
+        by solve( TEEL1( ~pid.1, ~tls, ~tokenL, ~blinder.1 ) ▶₂ #vr.3 )
+      next
+        case Lchain_att
+        by solve( TEEL1( ~pid.1, ~tls, ~tokenL, ~blinder.1 ) ▶₂ #vr.3 )
+      next
+        case create_TEE
+        by solve( TEEL1( ~pid.1, ~tls, ~tokenL, ~blinder.1 ) ▶₂ #vr.3 )
+      qed
+    next
+      case Uchain3
+      by solve( LinkableToken( ~tokenL ) ▶₁ #i )
+    next
+      case create_TEE
+      by solve( LinkableToken( ~tokenL ) ▶₁ #i )
+    next
+      case tee_comp
+      by contradiction
+    qed
+  next
+    case tee_comp_case_3
+    solve( (¬(#k.1 < #vr))  ∥ (¬(#k.1 < #i)) )
+      case case_1
+      solve( TEETokenL( ~pid.1, ~tokenL ) ▶₀ #vr )
+        case Lchain3
+        solve( (~tokenL = ~ntokL)  ∥
+               (∃ #l.
+                 (ProviderAcceptLinkable( ~pid.1, ~tokenL ) @ #l)
+                ∧
+                 (#vr.4 < #l) ∧ (#l < #k.1)) )
+          case case_1
+          solve( LinkableToken( ~ntokL ) ▶₁ #i )
+            case Lchain2
+            solve( ProviderAnswerLChain( ~tls,
+                                         <~ntokL, sign(blind(~newtoken, ~blinder.1), x)>
+                   ) ▶₁ #k.1 )
+              case Lchain2
+              by contradiction /* cyclic */
+            qed
+          qed
+        qed
+      next
+        case create_TEE
+        solve( ProviderAnswerLChain( ~tls,
+                                     <~ntokL, sign(blind(~newtoken, ~blinder.1), x)>
+               ) ▶₁ #k.1 )
+          case Lchain2
+          by solve( (~tokenL = ~ntokL)  ∥
+                    (∃ #l.
+                      (ProviderAcceptLinkable( ~pid.1, ~tokenL ) @ #l)
+                     ∧
+                      (#k < #l) ∧ (#l < #k.1)) )
+        qed
+      next
+        case tee_comp
+        by contradiction
+      qed
+    next
+      case case_2
+      solve( TEETokenL( ~pid.1, ~tokenL ) ▶₀ #vr )
+        case Lchain3
+        solve( (~tokenL = ~ntokL)  ∥
+               (∃ #l.
+                 (ProviderAcceptLinkable( ~pid.1, ~tokenL ) @ #l)
+                ∧
+                 (#vr.4 < #l) ∧ (#l < #k.1)) )
+          case case_1
+          solve( LinkableToken( ~ntokL ) ▶₁ #i )
+            case Lchain2
+            solve( ProviderAnswerLChain( ~tls,
+                                         <~ntokL, sign(blind(~newtoken, ~blinder.1), x)>
+                   ) ▶₁ #k.1 )
+              case Lchain2
+              by contradiction /* cyclic */
+            qed
+          qed
+        qed
+      next
+        case create_TEE
+        solve( ProviderAnswerLChain( ~tls,
+                                     <~ntokL, sign(blind(~newtoken, ~blinder.1), x)>
+               ) ▶₁ #k.1 )
+          case Lchain2
+          solve( LinkableToken( ~tokenL ) ▶₁ #i )
+            case create_TEE
+            by solve( (~tokenL = ~ntokL)  ∥
+                      (∃ #l.
+                        (ProviderAcceptLinkable( ~pid.1, ~tokenL ) @ #l)
+                       ∧
+                        (#k < #l) ∧ (#l < #k.1)) )
+          qed
+        qed
+      next
+        case tee_comp
+        by contradiction /* cyclic */
+      qed
+    qed
+  qed
+qed
+
+
+
+
+
+
+// Core goal number 1
+lemma PCS_LinkableAuth[hide_lemma=tee_state, hide_lemma=authAtt]:
+ "All tok #i. AttUseLToken(tok)@i ==>
+      (Ex pid t #j. Comp(pid,t)@j & j <i &
+       (All  #k. TEEHealLinkable(pid)@k ==> k < j & k<i)
+)
+"
+
+
+
+
+
+
+
+lemma ossid[reuse,use_induction]:
+ "All sid #i. SSid(sid)@i ==> Ex #j. OSid(sid)@j & j<i"
+
+lemma ssid[reuse]:
+ "All sid1 sid2 #i #j. SSid(sid1)@i & SSid(sid2)@j ==> sid1=sid2"
+
+lemma inbetween[reuse,use_induction]:
+  "All skP1 skA1 skP2 skA2 #i #j. Keys(skP1,skA1)@i & Keys(skP2,skA2)@j & i<j ==>
+     Ex #k. Deprecate(skP1,skA1)@k & i<k & (k<j | #j=#k)"
+
+// auto provable
+// lemma key_orig[reuse,use_induction]:
+//  "All skP skA #i. CurrentKeys(pk(skP),pk(skA))@i ==>
+//     Ex #j. Keys(skP,skA)@j & j < i
+//     & not (Ex #k. Deprecate(skP,skA)@k & k<j )
+//     "
+
+lemma key_orig[reuse,use_induction]:
+ "All skP skA #i. CurrentKeys(pk(skP),pk(skA))@i ==>
+    Ex #j. Keys(skP,skA)@j & j < i
+    & not (Ex skP2 skA2 #k. Deprecate(skP2,skA2)@k & j<k & k<i & not(skP2 = 'n'))
+    "
+induction
+  case empty_trace
+  by contradiction /* from formulas */
+next
+  case non_empty_trace
+  simplify
+  solve( CurrentKeys( pk(skP), pk(skA) ) @ #i )
+    case Lchain0
+    solve( !PKey( pk(skP), pk(skA) ) ▶₀ #i )
+      case renew_ServerKey
+      solve( Deprecate( skP2, skA2 ) @ #k.1 )
+        case dummy
+        by contradiction /* from formulas */
+      next
+        case renew_ServerKey
+        by contradiction /* from formulas */
+      qed
+    qed
+  next
+    case Lchain2
+    solve( !Skey( ~skS, ~skA ) ▶₂ #i )
+      case renew_ServerKey
+      solve( Deprecate( skP2, skA2 ) @ #k )
+        case dummy
+        by contradiction /* from formulas */
+      next
+        case renew_ServerKey
+        by contradiction /* from formulas */
+      qed
+    qed
+  next
+    case Lchain3
+    solve( !PKey( pk(skP), pk(skA) ) ▶₀ #i )
+      case renew_ServerKey
+      solve( Deprecate( skP2, skA2 ) @ #k.1 )
+        case dummy
+        by contradiction /* from formulas */
+      next
+        case renew_ServerKey
+        by contradiction /* from formulas */
+      qed
+    qed
+  next
+    case Lchain_att
+    solve( !Skey( ~skS, ~skA ) ▶₂ #i )
+      case renew_ServerKey
+      solve( Deprecate( skP2, skA2 ) @ #k )
+        case dummy
+        by contradiction /* from formulas */
+      next
+        case renew_ServerKey
+        by contradiction /* from formulas */
+      qed
+    qed
+  next
+    case Uchain1
+    solve( !PKey( pk(skP), pk(skA) ) ▶₁ #i )
+      case renew_ServerKey
+      solve( Deprecate( skP2, skA2 ) @ #k.1 )
+        case dummy
+        by contradiction /* from formulas */
+      next
+        case renew_ServerKey
+        by contradiction /* from formulas */
+      qed
+    qed
+  next
+    case Uchain2
+    solve( !Skey( ~skP, ~skA ) ▶₀ #i )
+      case renew_ServerKey
+      solve( Deprecate( skP2, skA2 ) @ #k )
+        case dummy
+        by contradiction /* from formulas */
+      next
+        case renew_ServerKey
+        by contradiction /* from formulas */
+      qed
+    qed
+  next
+    case Uchain2_att
+    solve( !Skey( ~skP, ~skA ) ▶₀ #i )
+      case renew_ServerKey
+      solve( Deprecate( skP2, skA2 ) @ #k )
+        case dummy
+        by contradiction /* from formulas */
+      next
+        case renew_ServerKey
+        by contradiction /* from formulas */
+      qed
+    qed
+  next
+    case Uchain3
+    solve( !PKey( pk(skP), pk(skA) ) ▶₀ #i )
+      case renew_ServerKey
+      solve( Deprecate( skP2, skA2 ) @ #k.1 )
+        case dummy
+        by contradiction /* from formulas */
+      next
+        case renew_ServerKey
+        by contradiction /* from formulas */
+      qed
+    qed
+  next
+    case create_TEE
+    solve( !Skey( ~skP, ~skA ) ▶₄ #i )
+      case renew_ServerKey
+      solve( Deprecate( skP2, skA2 ) @ #k )
+        case dummy
+        by contradiction /* from formulas */
+      next
+        case renew_ServerKey
+        by contradiction /* from formulas */
+      qed
+    qed
+  qed
+qed
+
+lemma consist[reuse]:
+ "All pkP pkA #i. CurrentKeys(pkP,pkA)@i ==> Ex skP skA. pkP=pk(skP) & pkA=pk(skA)"
+
+// we add a new restriction as a lemma, correct for the deprecation
+lemma deprecateBislefttwo[reuse]:
+ "All skP1 skA1 pkP1 pkA1 pkA2  #i #j #k.
+CurrentKeys(pkP1,pkA1)@i &   Deprecate(skP1,skA1)@j &  CurrentKeys(pkP1,pkA2)@k & i < j & j<k & not(skP1='n') ==> F
+         
+"
+
+
+
+lemma authAttPCS[use_induction,reuse, hide_lemma=PCS_LinkableAuth,hide_lemma=key_orig,
+hide_lemma=inbetween,hide_lemma=ossid,hide_lemma=consist]:
+ "All skP skS skP2 pid t1 sigt1 bl tok lt1 #i #j #k. CompF(pid,t1,sigt1)@i &
+                                      CompL(pid,lt1)@i &
+                              sigt1=unblind(sign(blind(t1,bl),skP),bl) &
+                              Deprecate(skP,skS)@j &// if we deprecatd the keys after the compromise
+			      not(skP='n') &
+			      TTPAcceptS('att',tok,skP2)@k & // and the attacker can still login, then it has used the compromised linkable token and the honest user is locked out
+			       i < j & j < k
+
+==>
+      // (Ex t1 pid tok sigtok bl skPold skSold #j #l. CompL(pid,t1)@j &  CompF(pid,tok,sigtok)@j &
+      //      sigtok=unblind(sign(blind(tok,bl),skPold),bl) &
+      // 	   Deprecated(skPold,skSold) &					 
+      // 	    j<i & AttUseLToken(t1)@l & j<l  &
+      //  (All  #k. TEEHealLinkable(pid)@k ==> k < j & k<i))
+      (Ex t1 #l. AttUseLToken(t1)@l )
+
+
+"
+induction
+  case empty_trace
+  by contradiction
+next
+  case non_empty_trace
+  simplify
+  solve( TTPAcceptS( 'att', tok, skP2 ) @ #k.1 )
+    case Uchain2_att
+    solve( !KU( unblind(sign(blind(~token.1, x), ~skP.2), x)
+           ) @ #vk.3 )
+      case c_unblind
+      solve( !KU( sign(blind(~token.1, x), ~skP.2) ) @ #vk.7 )
+        case Lchain_att
+        by contradiction /* from formulas */
+      next
+        case Uchain2_att_case_1
+        solve( (#j = #vr)  ∥ (#vr < #j)  ∥
+               (∃ t1 #l. (AttUseLToken( t1 ) @ #l) ∧ ¬(last(#l))) )
+          case case_1
+          by solve( Deprecate( skP, skS ) @ #j )
+        next
+          case case_2
+          solve( Deprecate( 'n', skS ) @ #j )
+            case dummy
+            solve( TEETokenU( ~pid, ~token,
+                              unblind(sign(blind(~token, bl), 'n'), bl)
+                   ) ▶₁ #i )
+              case tee_comp
+              by contradiction /* cyclic */
+            qed
+          next
+            case renew_ServerKey
+            solve( TEETokenU( ~pid, ~token,
+                              unblind(sign(blind(~token, bl), 'n'), bl)
+                   ) ▶₁ #i )
+              case tee_comp
+              by contradiction /* cyclic */
+            qed
+          qed
+        next
+          case case_3
+          by contradiction /* from formulas */
+        qed
+      next
+        case Uchain2_att_case_2
+        solve( (#j = #vr)  ∥ (#vr < #j)  ∥
+               (∃ t1 #l. (AttUseLToken( t1 ) @ #l) ∧ ¬(last(#l))) )
+          case case_1
+          by solve( Deprecate( skP, skS ) @ #j )
+        next
+          case case_2
+          solve( Deprecate( skP, skS ) @ #j )
+            case dummy
+            solve( TEETokenU( ~pid, ~token,
+                              unblind(sign(blind(~token, bl), 'n'), bl)
+                   ) ▶₁ #i )
+              case tee_comp
+              by contradiction /* cyclic */
+            qed
+          next
+            case renew_ServerKey
+            solve( (¬(#k < #vr.2))  ∥ (¬(#vr.2 < #k))  ∥ (x.2 = 'n') )
+              case case_1
+              solve( !Skey( ~skP.2, ~skA.1 ) ▶₄ #k )
+                case renew_ServerKey
+                solve( (¬(#vr < #vr.3))  ∥ (¬(#vr.3 < #vr))  ∥ (x.3 = 'n') )
+                  case case_1
+                  by solve( !Skey( ~skP.3, ~skA.2 ) ▶₀ #k.1 )
+                next
+                  case case_2
+                  by solve( !Skey( ~skP.3, ~skA.2 ) ▶₀ #k.1 )
+                next
+                  case case_3
+                  by solve( !Skey( ~skP.3, ~skA.2 ) ▶₀ #k.1 )
+                qed
+              qed
+            next
+              case case_2
+              solve( !Skey( ~skP.2, ~skA.1 ) ▶₄ #k )
+                case renew_ServerKey
+                by solve( !Skey( ~skP.3, ~skA.2 ) ▶₀ #k.1 )
+              qed
+            next
+              case case_3
+              solve( !Skey( ~skP.2, ~skA.1 ) ▶₄ #k )
+                case renew_ServerKey
+                by solve( !Skey( ~skP.3, ~skA.2 ) ▶₀ #k.1 )
+              qed
+            qed
+          qed
+        next
+          case case_3
+          by contradiction /* from formulas */
+        qed
+      next
+        case c_sign
+        solve( !Skey( ~skP.1, ~skA ) ▶₄ #k )
+          case renew_ServerKey
+          solve( !Skey( ~skP.2, ~skA.1 ) ▶₀ #k.1 )
+            case renew_ServerKey
+            by contradiction /* from formulas */
+          qed
+        qed
+      qed
+    next
+      case tee_comp
+      solve( TEETokenU( ~pid, ~token,
+                        unblind(sign(blind(~token, bl), ~skP), bl)
+             ) ▶₁ #i )
+        case Lchain3
+        by contradiction /* from formulas */
+      next
+        case Uchain3
+        by contradiction /* from formulas */
+      next
+        case create_TEE
+        by contradiction /* from formulas */
+      next
+        case tee_comp
+        by contradiction /* cyclic */
+      qed
+    qed
+  qed
+qed
+
+
+
+
+
+
+
+end

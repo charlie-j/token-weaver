@@ -1,0 +1,843 @@
+theory UnlinkAuth
+
+/*
+
+==============================================================================
+summary of summaries:
+
+analyzed: AuthorizationToken_FS_PCS.spthy
+
+  sanity (exists-trace): verified (6 steps)
+  sanity_comp (exists-trace): verified (16 steps)
+  tee_statestrong (all-traces): verified (24 steps)
+  tee_uniq (all-traces): verified (60 steps)
+  tee_progress (all-traces): verified (76 steps)
+  tee_state (all-traces): verified (23 steps)
+  mastersec (all-traces): verified (7 steps)
+  authAtt (all-traces): verified (18 steps)
+  auth (all-traces): verified (16 steps)
+  authAttPCS (all-traces): verified (88 steps)
+  authPCS (all-traces): verified (10 steps)
+
+==============================================================================
+
+real	0m11.626s
+user	0m48.469s
+sys	0m15.361s
+─( 17:12:44 )─< ~/Workspace/Research/tee/tamarin >────────────────────────────(git)─[tee/main]─[ 0 ]─
+$ time tamarin-prover AuthorizationToken_FS_PCS.spthy --prove
+
+
+
+*/
+
+begin
+
+functions: pk/1, sign/2, checksign/3, blind/2, unblind/2, true/0
+equations: checksign( sign(m,k),m,pk(k) ) = true,
+	    checksign( unblind(sign(blind(m,r),k),r),m,pk(k) ) = true,
+	   //  unblind( blind(m,r),r ) = m,
+           // unblind( sign(blind(m,r),k),r ) = sign(m,k)
+
+
+rule init_Server:
+     [Fr(~sk)]--[MasterKey(~sk), Once('server')]->[!Skey(~sk), !PKey(pk(~sk))]
+
+
+
+
+rule create_TEE:
+     [Fr(~token), Fr(~pid)]--[PID(~pid)]->[TEE( ~pid, ~token,  'null', 'init')]
+
+
+
+
+rule init_sign_TEE:
+     [Fr(~factory),TEE(~pid, ~token, 'null', 'init'), Fr(~blinder)]-->[TEE(~pid, ~token,'null',<'init', ~blinder, ~factory>), ServerChannel(~factory,<'init',blind(~token, ~blinder)>)]
+
+rule server_blind:
+   [!Skey(~sk), ServerChannel(~factory,<'init',blindtok>)]--[Signed(blindtok)]->[ServerChannel(~factory,<'rblind',sign(blindtok,~sk)>)]
+
+
+rule final_init_TEE:
+   let sigtok=unblind(blindedtok,~blinder) in
+     [TEE(~pid, ~token, 'null', < 'init', ~blinder, ~factory>), ServerChannel(~factory,<'rblind',blindedtok>)]--[TEEState( ~pid, ~token, sigtok)]->[TEE(~pid, ~token, sigtok, 'null')]
+
+
+
+
+// We don't assume that the attacker has full network control, but only of a part of it. As such, by default it cannot intercept communcations between an honest TEE and a provider. Such connections will not be authenticated however, only secrecy/integrity protected.
+
+rule attChannelIn:
+  [In(x)]-->[TTPChannel('att',x)]
+
+rule attChannelOut:
+  [TTPChannel('att',x)]-->[Out(x)]
+
+
+// We both authenticate using the token and renew the token at the same time
+rule TEE_ttp_auth:
+ [Fr(~tls), TEE( ~pid, ~token, sigtok, 'null'), Fr(~newtoken), Fr(~blinder)]--[TTPAuth(~token,~pid)]->[TTPChannel(~tls, <'auth', ~token, sigtok,blind(~newtoken,~blinder) >), TEE( ~pid, ~token, sigtok, <'auth', ~tls,~blinder , ~newtoken> ), BookkeepTEE(~newtoken,~pid)] 
+
+
+// Each token will be accepted once
+rule TEE_ttp_auth2:
+[!Skey(~sk),!PKey(pks), TTPChannel(tls, <'auth', token, sigtok,blindtok >)]--[Eq(checksign(sigtok,token,pks),true), Once(token), TTPAccept(tls,token), Signed(blindtok)]->[TTPChannel(tls,<'accept', sign(blindtok,~sk) >)]
+
+
+
+rule TEE_ttp_auth3:
+   let nsigtok=unblind(sigblind,~blinder) in
+[!PKey(pks), TEE( ~pid, ~token, sigtok, <'auth', ~tls,~blinder,~newtoken>   ), BookkeepTEE(~newtoken,~pid)
+, TTPChannel(~tls,<'accept',sigblind>)]--[
+TEEState( ~pid, ~newtoken, nsigtok),
+TEEAck(~pid,~token),
+Eq(checksign(nsigtok,~newtoken,pks),true)
+]->[TEE( ~pid, ~newtoken, nsigtok, 'null'  )]
+
+
+
+
+
+rule tee_comp:
+ [TEE( ~pid, ~token, sigtok, 'null'  )]--[TEEState( ~pid, ~token,  sigtok), Comp(~pid,~token)]->[ Out( < ~pid, ~token, sigtok > ),
+ TEE( ~pid, ~token, sigtok, 'null'  )
+ ]
+
+
+
+
+restriction verify:
+ "All m1 m2 #i. Eq(m1,m2)@i ==> m1=m2"
+
+
+
+restriction once:
+ "All #i #j x. Once(x)@i & Once(x)@j ==> #i=#j"
+
+
+restriction componce:
+ "All p t1 t2 #i #j. Comp(p,t1)@i & Comp(p,t2)@j ==> #i=#j"
+
+
+
+lemma sanity:
+exists-trace
+ "Ex chan pks #i. TTPAccept(chan,pks)@i"
+
+
+lemma sanity_comp:
+exists-trace
+ "Ex pks #i. TTPAccept('att',pks)@i"
+
+lemma tee_statestrong[sources]:
+  "All r t  sigtok #i. TEEState(r,t,sigtok)@i ==> Ex sk bl #j #k. MasterKey(sk)@j &  PID(r)@k & sigtok=unblind(sign(blind(t,bl),sk),bl) "
+
+
+lemma tee_uniq[reuse, heuristic=S]:
+  "All r t1 #i #j. TEEAck(r,t1)@i & TEEAck(r,t1)@j ==> #i=#j"
+
+
+
+lemma tee_progress[use_induction,reuse]:
+ "All r t1 s1 t2 s2 #i #j. TEEState(r,t1,s1)@i & TEEState(r,t2,s2)@j & i < j & not(t1=t2)==>
+      (Ex tls #l. TTPAccept(tls,t1)@l & i<l & l < j & not(tls='att'))"
+induction
+  case empty_trace
+  by contradiction
+next
+  case non_empty_trace
+  simplify
+  solve( TEEState( r, t2, s2 ) @ #j )
+    case TEE_ttp_auth3
+    solve( TEE( ~pid, ~token, sigtok,
+                <'auth', ~tls, ~blinder, ~newtoken>
+           ) ▶₁ #j )
+      case TEE_ttp_auth_case_1
+      solve( !PKey( pk(x) ) ▶₀ #j )
+        case init_Server
+        solve( TEEState( ~pid, t1, s1 ) @ #i )
+          case TEE_ttp_auth3
+          by contradiction /* cyclic */
+        next
+          case final_init_TEE
+          solve( TEE( ~pid, ~token, 'null', <'init', ~blinder, ~factory>
+                 ) ▶₀ #i )
+            case init_sign_TEE
+            solve( TTPChannel( ~tls,
+                               <'accept', sign(blind(~newtoken, ~blinder.1), ~sk)>
+                   ) ▶₃ #j )
+              case TEE_ttp_auth2
+              solve( TTPChannel( ~tls,
+                                 <'auth', token.1, sigtok, blind(~newtoken, ~blinder.1)>
+                     ) ▶₂ #vr.5 )
+                case TEE_ttp_auth
+                by contradiction /* from formulas */
+              qed
+            qed
+          qed
+        next
+          case tee_comp
+          by contradiction /* cyclic */
+        qed
+      qed
+    next
+      case TEE_ttp_auth_case_2
+      solve( TEEState( ~pid, t1, s1 ) @ #i )
+        case TEE_ttp_auth3
+        solve( (#i = #vr.1)  ∥ (#vr.1 < #i)  ∥ (~newtoken = ~token.1)  ∥
+               (∃ tls #l.
+                 (TTPAccept( tls, ~newtoken ) @ #l)
+                ∧
+                 (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.1) ∧ (¬(tls = 'att'))  ) )
+          case case_1
+          solve( TTPChannel( ~tls.1,
+                             <'accept', sign(blind(~newtoken.1, ~blinder.1), x)>
+                 ) ▶₃ #j )
+            case TEE_ttp_auth2
+            solve( TTPChannel( ~tls.1,
+                               <'auth', token.3, sigtok.2, blind(~newtoken.1, ~blinder.1)>
+                   ) ▶₂ #vr.3 )
+              case TEE_ttp_auth
+              by contradiction /* from formulas */
+            qed
+          qed
+        next
+          case case_2
+          by contradiction /* cyclic */
+        next
+          case case_3
+          solve( TTPChannel( ~tls.1,
+                             <'accept', sign(blind(~newtoken.1, ~blinder.2), x.1)>
+                 ) ▶₃ #j )
+            case TEE_ttp_auth2
+            solve( TTPChannel( ~tls.1,
+                               <'auth', token.4, sigtok.3, blind(~newtoken.1, ~blinder.2)>
+                   ) ▶₂ #vr.4 )
+              case TEE_ttp_auth
+              by contradiction /* from formulas */
+            qed
+          qed
+        next
+          case case_4
+          by contradiction /* from formulas */
+        qed
+      next
+        case final_init_TEE
+        solve( (~token = ~token.1)  ∥
+               (∃ tls #l.
+                 (TTPAccept( tls, ~token ) @ #l)
+                ∧
+                 (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.1) ∧ (¬(tls = 'att'))  ) )
+          case case_1
+          solve( TTPChannel( ~tls,
+                             <'accept', sign(blind(~newtoken, ~blinder.2), x)>
+                 ) ▶₃ #j )
+            case TEE_ttp_auth2
+            solve( TTPChannel( ~tls,
+                               <'auth', token.4, sigtok.2, blind(~newtoken, ~blinder.2)>
+                   ) ▶₂ #vr.4 )
+              case TEE_ttp_auth
+              by contradiction /* from formulas */
+            qed
+          qed
+        next
+          case case_2
+          by contradiction /* from formulas */
+        qed
+      next
+        case tee_comp
+        solve( TTPChannel( ~tls,
+                           <'accept', sign(blind(~newtoken, ~blinder.1), x)>
+               ) ▶₃ #j )
+          case TEE_ttp_auth2
+          solve( TTPChannel( ~tls,
+                             <'auth', token.5, sigtok.2, blind(~newtoken, ~blinder.1)>
+                 ) ▶₂ #vr.4 )
+            case TEE_ttp_auth
+            solve( (~token = ~token.1)  ∥
+                   (∃ tls #l.
+                     (TTPAccept( tls, ~token ) @ #l)
+                    ∧
+                     (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.1)  ∧ (¬(tls = 'att')) ) )
+              case case_1
+              by contradiction /* from formulas */
+            next
+              case case_2
+              by contradiction /* from formulas */
+            qed
+          qed
+        qed
+      qed
+    next
+      case TEE_ttp_auth_case_3
+      solve( TTPChannel( ~tls,
+                         <'accept', sign(blind(~newtoken, ~blinder), x)>
+             ) ▶₃ #j )
+        case TEE_ttp_auth2
+        solve( TTPChannel( ~tls,
+                           <'auth', token.2, sigtok, blind(~newtoken, ~blinder)>
+               ) ▶₂ #vr.2 )
+          case TEE_ttp_auth
+          solve( TEEState( ~pid, t1, s1 ) @ #i )
+            case TEE_ttp_auth3
+            solve( (~newtoken = ~token.1)  ∥
+                   (∃ tls #l.
+                     (TTPAccept( tls, ~newtoken ) @ #l)
+                    ∧
+                     (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.1)  ∧ (¬(tls = 'att'))  ) )
+              case case_1
+              by contradiction /* from formulas */
+            next
+              case case_2
+              by contradiction /* from formulas */
+            qed
+          next
+            case final_init_TEE
+            solve( (~token = ~token.1)  ∥
+                   (∃ tls #l.
+                     (TTPAccept( tls, ~token ) @ #l)
+                    ∧
+                     (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.1)  ∧ (¬(tls = 'att')) ) )
+              case case_1
+              by contradiction /* from formulas */
+            next
+              case case_2
+              by contradiction /* from formulas */
+            qed
+          next
+            case tee_comp
+            by contradiction /* from formulas */
+          qed
+        qed
+      qed
+    qed
+  next
+    case final_init_TEE
+    solve( (last(#j))  ∥ (t1 = ~token)  ∥
+           (∃ tls #l.
+             (TTPAccept( tls, t1 ) @ #l)
+            ∧
+             (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #j)  ∧ (¬(tls = 'att')) ) )
+      case case_1
+      solve( TEE( ~pid, ~token, 'null', <'init', ~blinder, ~factory>
+             ) ▶₀ #j )
+        case init_sign_TEE
+        solve( ServerChannel( ~factory, <'rblind', blindedtok> ) ▶₁ #j )
+          case server_blind
+          solve( TEEState( ~pid, t1, s1 ) @ #i )
+            case TEE_ttp_auth3
+            by contradiction
+          next
+            case final_init_TEE
+            by contradiction
+          next
+            case tee_comp
+            by contradiction
+          qed
+        qed
+      qed
+    next
+      case case_2
+      by contradiction
+    next
+      case case_3
+      by contradiction
+    qed
+  next
+    case tee_comp
+    solve( (last(#j))  ∥ (t1 = ~token)  ∥
+           (∃ tls #l.
+             (TTPAccept( tls, t1 ) @ #l)
+            ∧
+             (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #j)  ∧ (¬(tls = 'att')) ) )
+      case case_1
+      solve( TEEState( ~pid, t1, s1 ) @ #i )
+        case TEE_ttp_auth3
+        solve( TTPChannel( ~tls,
+                           <'accept', sign(blind(~newtoken, ~blinder), x)>
+               ) ▶₃ #i )
+          case TEE_ttp_auth2
+          solve( TEE( ~pid, ~token.1, s2, 'null' ) ▶₀ #j )
+            case TEE_ttp_auth3
+            solve( (#vr.2 = #i)  ∥ (#i < #vr.2)  ∥ (~token.1 = ~newtoken)  ∥
+                   (∃ tls #l.
+                     (TTPAccept( tls, ~token.1 ) @ #l)
+                    ∧
+                     (¬(last(#l))) ∧ (#vr.2 < #l) ∧ (#l < #i)  ∧ (¬(tls = 'att')) ) )
+              case case_1
+              by contradiction /* from formulas */
+            next
+              case case_2
+              solve( (~newtoken = ~token.1)  ∥
+                     (∃ tls #l.
+                       (TTPAccept( tls, ~newtoken ) @ #l)
+                      ∧
+                       (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.2)  ∧ (¬(tls = 'att')) ) )
+                case case_1
+                by contradiction /* from formulas */
+              next
+                case case_2
+                by contradiction /* from formulas */
+              qed
+            next
+              case case_3
+              by contradiction /* from formulas */
+            next
+              case case_4
+              by contradiction /* cyclic */
+            qed
+          next
+            case final_init_TEE
+            by contradiction /* cyclic */
+          next
+            case tee_comp
+            by contradiction /* cyclic */
+          qed
+        qed
+      next
+        case final_init_TEE
+        solve( TEE( ~pid, ~token, 'null', <'init', ~blinder, ~factory>
+               ) ▶₀ #i )
+          case init_sign_TEE
+          solve( ServerChannel( ~factory, <'rblind', blindedtok> ) ▶₁ #i )
+            case server_blind
+            solve( TEE( ~pid, ~token.1, s2, 'null' ) ▶₀ #j )
+              case TEE_ttp_auth3
+              solve( (~token = ~token.1)  ∥
+                     (∃ tls #l.
+                       (TTPAccept( tls, ~token ) @ #l)
+                      ∧
+                       (¬(last(#l))) ∧ (#i < #l) ∧ (#l < #vr.4)  ∧ (¬(tls = 'att')) ) )
+                case case_1
+                by contradiction
+              next
+                case case_2
+                by contradiction
+              qed
+            next
+              case final_init_TEE
+              by contradiction
+            next
+              case tee_comp
+              by contradiction
+            qed
+          qed
+        qed
+      next
+        case tee_comp
+        by contradiction
+      qed
+    next
+      case case_2
+      by contradiction
+    next
+      case case_3
+      by contradiction
+    qed
+  qed
+qed
+
+ lemma tee_state[use_induction,reuse]:
+  "All r t  sigtok #i. TEEState(r,t,sigtok)@i ==> Ex #j. PID(r)@j"
+
+lemma mastersec[reuse]:
+ "not(Ex sk #i #j. MasterKey(sk)@i & KU(sk)@j)"
+
+lemma authAtt[use_induction,reuse,hide_lemma=tee_state]:
+ "All tok #i. TTPAccept('att',tok)@i ==>
+      (Ex pid t #j. Comp(pid,t)@j)"
+
+
+lemma auth[use_induction,hide_lemma=tee_state]:
+ "All tls tok #i. TTPAccept(tls,tok)@i ==>
+      (Ex pid #j. TTPAuth(tok,pid)@j & j<i)
+      | (Ex pid t #j. Comp(pid,t)@j)"
+
+
+
+
+
+
+
+lemma authAttPCS[use_induction,reuse, hide_lemma=authAtt]:
+ "All tok #i. TTPAccept('att',tok)@i ==>
+      (Ex t1 pid #j #l. Comp(pid,t1)@j & j<i & TTPAccept('att',t1)@l & j<l &
+       (All t2 #k. TEEAck(pid,t2)@k ==> k < j & k<i))
+       |
+      (Ex pid #j. Comp(pid,tok)@j & j<i &
+       (All t2 #k. TEEAck(pid,t2)@k ==> k < j & k<i))       
+"
+induction
+  case empty_trace
+  by contradiction /* from formulas */
+next
+  case non_empty_trace
+  simplify
+  solve( !Skey( ~sk ) ▶₀ #i )
+    case init_Server
+    solve( !PKey( pk(x) ) ▶₁ #i )
+      case init_Server
+      solve( TTPChannel( 'att', <'auth', tok, sigtok, blindtok> ) ▶₂ #i )
+        case attChannelIn
+        solve( splitEqs(0) )
+          case split_case_1
+          solve( !KU( sign(tok, ~sk) ) @ #vk.5 )
+            case attChannelOut
+            solve( (∃ t1 pid #j #l.
+                     (Comp( pid, t1 ) @ #j) ∧ (TTPAccept( 'att', t1 ) @ #l)
+                    ∧
+                     (¬(last(#l))) ∧
+                     (¬(last(#j))) ∧
+                     (#j < #vr.3) ∧
+                     (#j < #l) ∧
+                     (∀ t2 #k.
+                       (TEEAck( pid, t2 ) @ #k)
+                      ⇒
+                       ((last(#k)) ∨ ((#k < #j) ∧ (#k < #vr.3)))))  ∥
+                   (∃ pid #j.
+                     (Comp( pid, token ) @ #j)
+                    ∧
+                     (¬(last(#j))) ∧
+                     (#j < #vr.3) ∧
+                     (∀ t2 #k.
+                       (TEEAck( pid, t2 ) @ #k)
+                      ⇒
+                       ((last(#k)) ∨ ((#k < #j) ∧ (#k < #vr.3))))) )
+              case case_1
+              solve( (last(#k))  ∥ ((#k < #j) ∧ (#k < #vr.3)) )
+                case case_1
+                solve( !Skey( ~sk.1 ) ▶₀ #l )
+                  case init_Server
+                  solve( !PKey( pk(x.1) ) ▶₁ #l )
+                    case init_Server
+                    solve( !PKey( pk(x) ) ▶₀ #k )
+                      case init_Server
+                      solve( (~token = ~newtoken)  ∥
+                             (∃ tls #l.
+                               (TTPAccept( tls, ~token ) @ #l)
+                              ∧
+                               (#j < #l) ∧ (#l < #k) ∧ (¬(tls = 'att'))) )
+                        case case_1
+                        solve( TTPChannel( ~tls,
+                                           <'accept', sign(blind(~newtoken, ~blinder), ~sk)>
+                               ) ▶₃ #k )
+                          case TEE_ttp_auth2
+                          solve( TEE( ~pid, ~newtoken, sigtok, 'null' ) ▶₀ #j )
+                            case TEE_ttp_auth3
+                            solve( BookkeepTEE( ~newtoken, ~pid ) ▶₂ #k )
+                              case TEE_ttp_auth_case_1
+                              solve( BookkeepTEE( ~newtoken, ~pid ) ▶₂ #vr.6 )
+                                case TEE_ttp_auth
+                                by contradiction /* cyclic */
+                              qed
+                            next
+                              case TEE_ttp_auth_case_2
+                              solve( BookkeepTEE( ~newtoken, ~pid ) ▶₂ #vr.6 )
+                                case TEE_ttp_auth
+                                by contradiction /* cyclic */
+                              qed
+                            next
+                              case TEE_ttp_auth_case_3
+                              by contradiction /* cyclic */
+                            qed
+                          next
+                            case final_init_TEE
+                            by solve( BookkeepTEE( ~newtoken, ~pid ) ▶₂ #k )
+                          next
+                            case tee_comp
+                            by contradiction /* cyclic */
+                          qed
+                        qed
+                      next
+                        case case_2
+                        by contradiction /* from formulas */
+                      qed
+                    qed
+                  qed
+                qed
+              next
+                case case_2
+                by contradiction /* from formulas */
+              qed
+            next
+              case case_2
+              solve( (last(#k))  ∥ ((#k < #j) ∧ (#k < #vr.3)) )
+                case case_1
+                solve( (~token = ~newtoken)  ∥
+                       (∃ tls #l.
+                         (TTPAccept( tls, ~token ) @ #l)
+                        ∧
+                         (#j < #l) ∧ (#l < #k) ∧ (¬(tls = 'att'))) )
+                  case case_1
+                  solve( !PKey( pk(x) ) ▶₀ #k )
+                    case init_Server
+                    solve( TEE( ~pid, ~newtoken, sigtok, 'null' ) ▶₀ #j )
+                      case TEE_ttp_auth3
+                      solve( BookkeepTEE( ~newtoken, ~pid ) ▶₂ #k )
+                        case TEE_ttp_auth_case_1
+                        solve( BookkeepTEE( ~newtoken, ~pid ) ▶₂ #vr.5 )
+                          case TEE_ttp_auth
+                          by contradiction /* cyclic */
+                        qed
+                      next
+                        case TEE_ttp_auth_case_2
+                        solve( BookkeepTEE( ~newtoken, ~pid ) ▶₂ #vr.5 )
+                          case TEE_ttp_auth
+                          by contradiction /* cyclic */
+                        qed
+                      next
+                        case TEE_ttp_auth_case_3
+                        by contradiction /* cyclic */
+                      qed
+                    next
+                      case final_init_TEE
+                      by solve( BookkeepTEE( ~newtoken, ~pid ) ▶₂ #k )
+                    next
+                      case tee_comp
+                      by contradiction /* cyclic */
+                    qed
+                  qed
+                next
+                  case case_2
+                  by contradiction /* from formulas */
+                qed
+              next
+                case case_2
+                by contradiction /* from formulas */
+              qed
+            qed
+          next
+            case c_sign
+            by contradiction /* from formulas */
+          qed
+        next
+          case split_case_2
+          solve( !KU( unblind(sign(blind(tok, x), ~sk), x) ) @ #vk.5 )
+            case c_unblind
+            solve( !KU( sign(blind(tok, x), ~sk) ) @ #vk.7 )
+              case attChannelOut
+              solve( (∃ t1 pid #j #l.
+                       (Comp( pid, t1 ) @ #j) ∧ (TTPAccept( 'att', t1 ) @ #l)
+                      ∧
+                       (¬(last(#l))) ∧
+                       (¬(last(#j))) ∧
+                       (#j < #vr.3) ∧
+                       (#j < #l) ∧
+                       (∀ t2 #k.
+                         (TEEAck( pid, t2 ) @ #k)
+                        ⇒
+                         ((last(#k)) ∨ ((#k < #j) ∧ (#k < #vr.3)))))  ∥
+                     (∃ pid #j.
+                       (Comp( pid, token ) @ #j)
+                      ∧
+                       (¬(last(#j))) ∧
+                       (#j < #vr.3) ∧
+                       (∀ t2 #k.
+                         (TEEAck( pid, t2 ) @ #k)
+                        ⇒
+                         ((last(#k)) ∨ ((#k < #j) ∧ (#k < #vr.3))))) )
+                case case_1
+                solve( (last(#k))  ∥ ((#k < #j) ∧ (#k < #vr.3)) )
+                  case case_1
+                  solve( !Skey( ~sk.1 ) ▶₀ #l )
+                    case init_Server
+                    solve( !PKey( pk(x.2) ) ▶₁ #l )
+                      case init_Server
+                      solve( !PKey( pk(x.1) ) ▶₀ #k )
+                        case init_Server
+                        solve( (~token = ~newtoken)  ∥
+                               (∃ tls #l.
+                                 (TTPAccept( tls, ~token ) @ #l)
+                                ∧
+                                 (#j < #l) ∧ (#l < #k) ∧ (¬(tls = 'att'))) )
+                          case case_1
+                          solve( BookkeepTEE( ~newtoken, ~pid ) ▶₂ #k )
+                            case TEE_ttp_auth_case_1
+                            solve( TEE( ~pid, ~newtoken, sigtok, 'null' ) ▶₀ #j )
+                              case TEE_ttp_auth3
+                              solve( BookkeepTEE( ~newtoken, ~pid ) ▶₂ #vr.9 )
+                                case TEE_ttp_auth
+                                by contradiction /* cyclic */
+                              qed
+                            next
+                              case tee_comp
+                              by contradiction /* cyclic */
+                            qed
+                          next
+                            case TEE_ttp_auth_case_2
+                            solve( TEE( ~pid, ~newtoken, sigtok, 'null' ) ▶₀ #j )
+                              case TEE_ttp_auth3
+                              solve( BookkeepTEE( ~newtoken, ~pid ) ▶₂ #vr.8 )
+                                case TEE_ttp_auth
+                                by contradiction /* cyclic */
+                              qed
+                            next
+                              case tee_comp
+                              by contradiction /* cyclic */
+                            qed
+                          next
+                            case TEE_ttp_auth_case_3
+                            by contradiction /* cyclic */
+                          qed
+                        next
+                          case case_2
+                          by contradiction /* from formulas */
+                        qed
+                      qed
+                    qed
+                  qed
+                next
+                  case case_2
+                  by contradiction /* from formulas */
+                qed
+              next
+                case case_2
+                solve( (last(#k))  ∥ ((#k < #j) ∧ (#k < #vr.3)) )
+                  case case_1
+                  solve( (~token = ~newtoken)  ∥
+                         (∃ tls #l.
+                           (TTPAccept( tls, ~token ) @ #l)
+                          ∧
+                           (#j < #l) ∧ (#l < #k) ∧ (¬(tls = 'att'))) )
+                    case case_1
+                    solve( TEE( ~pid, ~newtoken, sigtok, 'null' ) ▶₀ #j )
+                      case TEE_ttp_auth3
+                      solve( BookkeepTEE( ~newtoken, ~pid ) ▶₂ #k )
+                        case TEE_ttp_auth_case_1
+                        solve( BookkeepTEE( ~newtoken, ~pid ) ▶₂ #vr.5 )
+                          case TEE_ttp_auth
+                          by contradiction /* cyclic */
+                        qed
+                      next
+                        case TEE_ttp_auth_case_2
+                        solve( BookkeepTEE( ~newtoken, ~pid ) ▶₂ #vr.5 )
+                          case TEE_ttp_auth
+                          by contradiction /* cyclic */
+                        qed
+                      next
+                        case TEE_ttp_auth_case_3
+                        by contradiction /* cyclic */
+                      qed
+                    next
+                      case final_init_TEE
+                      by solve( BookkeepTEE( ~newtoken, ~pid ) ▶₂ #k )
+                    next
+                      case tee_comp
+                      by contradiction /* cyclic */
+                    qed
+                  next
+                    case case_2
+                    by contradiction /* from formulas */
+                  qed
+                next
+                  case case_2
+                  by contradiction /* from formulas */
+                qed
+              qed
+            next
+              case c_sign
+              by contradiction /* from formulas */
+            qed
+          next
+            case tee_comp
+            solve( (¬(#vr.2 < #k.1))  ∥ (~token = ~newtoken)  ∥
+                   (∃ tls #l.
+                     (TTPAccept( tls, ~token ) @ #l)
+                    ∧
+                     (#vr.2 < #l) ∧ (#l < #k.1) ∧ (¬(tls = 'att'))) )
+              case case_1
+              by contradiction /* from formulas */
+            next
+              case case_2
+              solve( BookkeepTEE( ~newtoken, ~pid ) ▶₂ #k.1 )
+                case TEE_ttp_auth_case_1
+                solve( TEE( ~pid, ~newtoken,
+                            unblind(sign(blind(~newtoken, x), ~sk), x), 'null'
+                       ) ▶₀ #vr.2 )
+                  case TEE_ttp_auth3
+                  solve( BookkeepTEE( ~newtoken, ~pid ) ▶₂ #vr.9 )
+                    case TEE_ttp_auth
+                    by contradiction /* from formulas */
+                  qed
+                next
+                  case tee_comp
+                  by contradiction /* cyclic */
+                qed
+              next
+                case TEE_ttp_auth_case_2
+                solve( TEE( ~pid, ~newtoken,
+                            unblind(sign(blind(~newtoken, x), ~sk), x), 'null'
+                       ) ▶₀ #vr.2 )
+                  case TEE_ttp_auth3
+                  solve( BookkeepTEE( ~newtoken, ~pid ) ▶₂ #vr.8 )
+                    case TEE_ttp_auth
+                    by contradiction /* from formulas */
+                  qed
+                next
+                  case tee_comp
+                  by contradiction /* cyclic */
+                qed
+              next
+                case TEE_ttp_auth_case_3
+                by contradiction /* cyclic */
+              qed
+            next
+              case case_3
+              by contradiction /* from formulas */
+            qed
+          qed
+        qed
+      qed
+    qed
+  qed
+qed
+
+
+lemma authPCS[use_induction, hide_lemma=authAtt,hide_lemma=tee_state]:
+ "All tls tok #i. TTPAccept(tls,tok)@i  ==>
+      (Ex pid #j. TTPAuth(tok,pid)@j & j<i)
+      | (
+      Ex to pid #j. Comp(pid,to)@j &
+       (All t #k. TEEAck(pid,t)@k ==> k < j))
+
+"
+simplify
+solve( !Skey( ~sk ) ▶₀ #i )
+  case init_Server
+  solve( !PKey( pk(x) ) ▶₁ #i )
+    case init_Server
+    solve( TTPChannel( tls, <'auth', tok, sigtok, blindtok> ) ▶₂ #i )
+      case TEE_ttp_auth_case_1
+      by contradiction /* from formulas */
+    next
+      case TEE_ttp_auth_case_2
+      by contradiction /* from formulas */
+    next
+      case TEE_ttp_auth_case_3
+      by contradiction /* from formulas */
+    next
+      case attChannelIn
+      solve( (∃ t1 pid #j #l.
+               (Comp( pid, t1 ) @ #j) ∧ (TTPAccept( 'att', t1 ) @ #l)
+              ∧
+               (#j < #i) ∧
+               (#j < #l) ∧
+               (∀ t2 #k. (TEEAck( pid, t2 ) @ #k) ⇒ (#k < #j) ∧ (#k < #i)))  ∥
+             (∃ pid #j.
+               (Comp( pid, tok ) @ #j)
+              ∧
+               (#j < #i) ∧
+               (∀ t2 #k. (TEEAck( pid, t2 ) @ #k) ⇒ (#k < #j) ∧ (#k < #i))) )
+        case case_1
+        by contradiction /* cyclic */
+      next
+        case case_2
+        by contradiction /* cyclic */
+      qed
+    qed
+  qed
+qed
+
+
+end

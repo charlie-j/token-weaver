@@ -1,5 +1,7 @@
 #! /usr/bin/env python3
 
+# CHANGES: Changed usage of Python's `pow(...)` to gmpy2's `powmod(...)`
+
 from Crypto.Util.number import size, inverse, ceil_div
 from Crypto.Hash import SHA384
 from Crypto.Util.strxor import strxor
@@ -7,6 +9,7 @@ from Crypto.PublicKey import RSA
 from Crypto.PublicKey.RSA import RsaKey
 from Crypto.Signature import pss
 from Crypto.Signature.pss import MGF1
+from gmpy2 import powmod
 
 from os import urandom
 
@@ -55,7 +58,7 @@ def EMSA_PSS_ENCODE(kBits: int, msg: bytes, sLen: int, salt: bytes = None) -> by
 def RSAVP1(public_key: RsaKey, r: int) -> int:
     e = public_key.e
     n = public_key.n
-    return pow(r, e, n)
+    return int(powmod(r, e, n))
 
 
 def random_integer_uniform(m: int, n: int) -> int:
@@ -108,7 +111,7 @@ def rsabssa_blind_sign(secret_key: RsaKey, blinded_msg: bytes) -> bytes:
     m = OS2IP(blinded_msg)
     if m >= n:
         raise "Invalid message length"
-    s = pow(m, d, n)
+    s = int(powmod(m, d, n))
     blind_sig = I2OSP(s, length=kLen)
     return blind_sig
 

@@ -6,6 +6,10 @@ from os import urandom
 
 from rsabssa import rsabssa_blind, rsabssa_blind_sign, rsabssa_finalize, rsa_pss_verify
 
+from ProviderStore import LinkableTokens, UnlinkableTokens
+
+from timeit import default_timer as timer
+
 ### Signature utilities ###
 
 sLen = 0
@@ -26,7 +30,7 @@ def unblind(public_key, blind_sig, inv, msg):
 
 def verify(public_key, sig, msg):
     rsa_pss_verify(public_key, sig, msg, sLen)
-
+    
 def sign_standard(secret_key, msg):
     signer = pss.new(secret_key)
     return signer.sign(SHA256.new(msg)) 
@@ -90,7 +94,9 @@ class TEE:
         self.unlinkable_token = (self.temp_token, token_sig)
 
         # Process and store new AC
-        pkT_sig = unblind(self.pkA, blinded_pkT_sig, self.temp_skBT, self.pkT.export_key(format='raw'))
+        pkT_sig = unblind(
+            self.pkA, blinded_pkT_sig, self.temp_skBT, self.pkT.export_key(format='raw')
+        )
         self.pkT_signed = pkT_sig
 
     def attest(self):
@@ -110,29 +116,34 @@ class Provider:
         self.skA = RSA.generate(2048)
         self.pkA = self.skA.public_key()
         # Valid linkable tokens
-        self.linkable_tokens = dict()
+        self.linkable_tokens = LinkableTokens()
         # Deprecated unlinkable tokens
-        self.unlinkable_tokens = set()
+        self.unlinkable_tokens = UnlinkableTokens()
 
     def new_tee(self, SN):
         # Set-up specified in 5.1
         linkable_token = urandom(32)
         new_TEE = TEE(self.pkP, self.pkA, SN, linkable_token)
-        self.linkable_tokens[SN] = linkable_token
+        self.linkable_tokens.add(SN, linkable_token)
         return new_TEE
 
     def unlinkable_chain_request(self, msg):
         #  linkable step of 5.2, provider step, also correspond to message 2 of Figure 1
         SN, blinded_token, linkable_token, pkSN = msg
+        
+        new_linkable_token = urandom(32)
+        db_s = timer()
         stored_lt = self.linkable_tokens.get(SN)
         if stored_lt is None or stored_lt != linkable_token:
             raise KeyError()
+        self.linkable_tokens.update(SN, new_linkable_token)
+        db_e = timer()
 
-        new_linkable_token = urandom(32)
-        self.linkable_tokens[SN] = new_linkable_token
+        crypt_s = timer()
         blinded_sig = sign(self.skP, blinded_token)
         sig_pkSN = sign_standard(self.skA, pkSN)
-        return (new_linkable_token, blinded_sig, sig_pkSN)
+        crypt_e = timer()
+        return ((new_linkable_token, blinded_sig, sig_pkSN), db_e - db_s, crypt_e - crypt_s)
 
     def ac_provisioning_request(self, msg):
         # AC provisioning of section 5.3, as well as message 2 of Figure 2
@@ -140,18 +151,30 @@ class Provider:
 
         # Check validity of unlinkable authentication
         # First, check if the unlinkable token is not deprecated
-        if not (unlinkable_token in self.unlinkable_tokens):
+        db_s1 = timer()
+        token_in_db = unlinkable_token in self.unlinkable_tokens
+        db_e1 = timer()
+        if not token_in_db:
+            crypt_s1 = timer()
             # we then check its signature
             verify(self.pkP, unlinkable_token_sig, unlinkable_token)
             # Exception ValueError raised if incorrect token
+            crypt_e1 = timer()
 
+            db_s2 = timer()
             self.unlinkable_tokens.add(unlinkable_token)
+            db_e2 = timer()
 
+            crypt_s2 = timer()
             # Everything is good; we then perform the two signatures
             blinded_token_sig = sign(self.skP, blinded_token)
             blinded_pkT_sig = sign(self.skA, blinded_pkT)
+            crypt_e2 = timer()
 
-            return (blinded_token_sig, blinded_pkT_sig)
+            db_t = (db_e1 - db_s1) + (db_e2 - db_s2)
+            crypt_t = (crypt_e1 - crypt_s1) + (crypt_e2 - crypt_s2)
+
+            return ((blinded_token_sig, blinded_pkT_sig), db_t, crypt_t)
 
 
 ### Third Party
@@ -165,48 +188,3 @@ class TTP:
         verify(self.pkA, pkT_signed, pkT)
         verifier = DSS.new(ECC.import_key(pkT, curve_name='P-256'), 'fips-186-3')
         verifier.verify(SHA256.new(b"attested text"), signature) # Raises ValueError if signature is not authentic
-
-
-if __name__ == '__main__':
-    # Simulate several protocol run
-    provider = Provider()
-    print("Provider initialized.")
-
-    # Create TEE with SN=1
-    tee = provider.new_tee(1)
-    print("New TEE initialized with linkable token.")
-
-    # Run one step of the unlinkable initialization chain
-    imsg1 = tee.unlinkable_chain_init()
-    imsg2 = provider.unlinkable_chain_request(imsg1)
-    tee.unlinkable_chain_finalize(imsg2)
-    print("Linkable token consumed to initialize unlinkable token chain.")
-
-    # Run AC multiple times
-    for i in range(1, 3):
-        ACmsg1 = tee.ac_provisioning_init()
-        ACmsg2 = provider.ac_provisioning_request(ACmsg1)
-        tee.ac_provisioning_finalize(ACmsg2)
-        print("Unlinkable AC provisioning performed.")
-
-    # Run one step of the unlinkable initialization chain
-    imsg1 = tee.unlinkable_chain_init()
-    imsg2 = provider.unlinkable_chain_request(imsg1)
-    tee.unlinkable_chain_finalize(imsg2)
-    print("Linkable token consumed to re-initialize unlinkable token chain.")
-
-    # Run AC multiple times
-    for i in range(1, 3):
-        ACmsg1 = tee.ac_provisioning_init()
-        ACmsg2 = provider.ac_provisioning_request(ACmsg1)
-        tee.ac_provisioning_finalize(ACmsg2)
-        print("Unlinkable AC provisioning performed.")
-
-
-    # Create TTP, given the pkA)
-    ttp = TTP(provider.pkA)
-
-    # make TEE attest
-    attestmsg = tee.attest()
-    # TTP check attest
-    ttp.check(attestmsg)
